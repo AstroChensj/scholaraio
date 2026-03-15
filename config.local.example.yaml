@@ -6,6 +6,8 @@
 # LLM API 密钥——用于元数据提取和内容富化
 # DeepSeek: https://platform.deepseek.com/
 # Or any OpenAI-compatible API 或任意 OpenAI 兼容 API
+# If using `llm.backend: codex-cli`, leave this empty and run `codex login` instead.
+# 如果使用 `llm.backend: codex-cli`，这里留空，改为先运行 `codex login`。
 llm:
   api_key: ""
 

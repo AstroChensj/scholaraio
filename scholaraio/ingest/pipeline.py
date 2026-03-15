@@ -1065,6 +1065,8 @@ def run_pipeline(
             llm_steps = {"toc", "l3"}
             has_llm_steps = bool(set(papers_steps) & llm_steps)
             workers = cfg.llm.concurrency if has_llm_steps else 1
+            if has_llm_steps and cfg.llm.backend == "codex-cli":
+                workers = min(workers, 4)
 
             def _process_one_paper(json_path: Path) -> tuple[str, dict[str, float]]:
                 """Process all papers_steps for one paper. Returns (status, timings)."""

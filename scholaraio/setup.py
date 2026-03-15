@@ -10,6 +10,7 @@ setup.py — ScholarAIO 环境检测与交互式安装向导
 from __future__ import annotations
 
 import importlib
+import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -141,6 +142,7 @@ class DepGroupStatus:
     name: str
     installed: bool
     missing: list[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 def check_dep_group(group: str) -> DepGroupStatus:
@@ -154,12 +156,15 @@ def check_dep_group(group: str) -> DepGroupStatus:
     """
     pairs = _DEP_GROUPS.get(group, [])
     missing = []
+    errors = []
     for import_name, pip_name in pairs:
         try:
             importlib.import_module(import_name)
         except ImportError:
             missing.append(pip_name)
-    return DepGroupStatus(name=group, installed=not missing, missing=missing)
+        except Exception as exc:
+            errors.append(f"{pip_name}: {exc}")
+    return DepGroupStatus(name=group, installed=not missing and not errors, missing=missing, errors=errors)
 
 
 # ============================================================================
@@ -215,11 +220,16 @@ def run_check(cfg: Config | None = None, lang: Lang = "zh") -> list[CheckResult]
             results.append(CheckResult(t(label_key, lang), True, pkgs))
         else:
             hint = f"pip install scholaraio[{group}]"
+            details = []
+            if status.missing:
+                details.append(f"{t('not_installed', lang)}: {', '.join(status.missing)}")
+            if status.errors:
+                details.append(f"runtime import error: {'; '.join(status.errors)}")
             results.append(
                 CheckResult(
                     t(label_key, lang),
                     False,
-                    f"{t('not_installed', lang)}: {', '.join(status.missing)}  → {hint}",
+                    f"{' | '.join(details)}  → {hint}",
                 )
             )
 
@@ -236,7 +246,12 @@ def run_check(cfg: Config | None = None, lang: Lang = "zh") -> list[CheckResult]
 
     # LLM API key
     key = cfg.resolved_api_key()
-    if key:
+    if cfg.llm.backend == "codex-cli":
+        if shutil.which("codex"):
+            results.append(CheckResult(t("llm_key", lang), True, "codex login"))
+        else:
+            results.append(CheckResult(t("llm_key", lang), False, "codex CLI not found"))
+    elif key:
         masked = key[:3] + "***" + key[-3:] if len(key) > 8 else "***"
         results.append(CheckResult(t("llm_key", lang), True, f"{t('configured', lang)} ({masked})"))
     else:

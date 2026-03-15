@@ -20,11 +20,13 @@ LLM API key 查找顺序：
        - openai-compat: DEEPSEEK_API_KEY → OPENAI_API_KEY
        - anthropic: ANTHROPIC_API_KEY
        - google: GOOGLE_API_KEY → GEMINI_API_KEY
+       - codex-cli: 无 API key，使用本机 `codex login` 凭据
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -57,9 +59,10 @@ class LLMConfig:
             - ``"openai-compat"`` — OpenAI 兼容协议（DeepSeek / OpenAI / vLLM / Ollama 等）
             - ``"anthropic"`` — Anthropic Messages API（Claude 系列）
             - ``"google"`` — Google Gemini API
+            - ``"codex-cli"`` — 调用本机 `codex exec`，复用 `codex login` 登录态
         model: 模型名称。
         base_url: API 基础 URL（不含 ``/v1/...`` 后缀）。
-        api_key: API 密钥，建议放 config.local.yaml 或环境变量。
+        api_key: API 密钥，建议放 config.local.yaml 或环境变量。``codex-cli`` 后端不需要。
         timeout: 普通 LLM 调用超时（秒）。
         timeout_toc: enrich-toc 调用超时（秒），标题列表较长。
         timeout_clean: validate_and_clean 调用超时（秒），结论全文较长。
@@ -262,15 +265,18 @@ class Config:
            - openai-compat: ``DEEPSEEK_API_KEY`` → ``OPENAI_API_KEY``
            - anthropic: ``ANTHROPIC_API_KEY``
            - google: ``GOOGLE_API_KEY`` → ``GEMINI_API_KEY``
+        4. ``codex-cli`` 后端: 若系统中存在 ``codex`` 可执行文件，则返回占位标记
 
         Returns:
-            API key 字符串，未找到则返回空字符串。
+            API key 字符串，或 ``codex-cli`` 可用时返回占位标记；未找到则返回空字符串。
         """
         if self.llm.api_key:
             return self.llm.api_key
         generic = os.environ.get("SCHOLARAIO_LLM_API_KEY", "")
         if generic:
             return generic
+        if self.llm.backend == "codex-cli":
+            return "__CODEX_CLI__" if shutil.which("codex") else ""
         backend_env_map: dict[str, tuple[str, ...]] = {
             "openai-compat": ("DEEPSEEK_API_KEY", "OPENAI_API_KEY"),
             "anthropic": ("ANTHROPIC_API_KEY",),

@@ -124,6 +124,20 @@ def _resolve_model_path(model_name: str, cache_dir: str, source: str) -> str | N
     if source != "modelscope":
         return None
 
+    # Prefer an already-materialized local cache directory. This avoids
+    # ModelScope cache-probing edge cases and prevents accidental fallback
+    # into HuggingFace/network code when the model is already present.
+    parts = model_name.split("/", 1)
+    if len(parts) == 2:
+        org, name = parts
+        candidates = [
+            Path(cache_dir) / org / name,
+            Path(cache_dir) / org / name.replace(".", "___"),
+        ]
+        for candidate in candidates:
+            if (candidate / "modules.json").exists():
+                return str(candidate)
+
     try:
         from modelscope import snapshot_download
     except ImportError:
@@ -779,7 +793,6 @@ def vsearch(
     Raises:
         FileNotFoundError: 索引文件或 ``paper_vectors`` 表不存在。
     """
-    import faiss
     import numpy as np
 
     if top_k is None:
@@ -798,10 +811,13 @@ def vsearch(
     finally:
         conn.close()
 
-    index, faiss_ids = _build_faiss_index(db_path)
-
     q_vec = np.array([_embed_text(query, cfg)], dtype="float32")
+
+    import faiss
+
     faiss.normalize_L2(q_vec)
+
+    index, faiss_ids = _build_faiss_index(db_path)
 
     # Fetch more candidates when post-filtering is needed
     fetch_k = top_k * 5 if (year or journal or paper_type or paper_ids) else top_k

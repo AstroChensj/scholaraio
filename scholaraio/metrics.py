@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import os
 import sqlite3
+import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Generator
@@ -391,13 +394,14 @@ def call_llm(
     根据 ``llm_cfg.backend`` 分发到对应后端：
     - ``"anthropic"``  — 调用 Anthropic 接口；
     - ``"google"``     — 调用 Google Gemini 接口；
+    - ``"codex-cli"``  — 调用本机 `codex exec`，复用 CLI 登录态；
     - 其他值           — 视为 OpenAI-compatible，使用 ``/v1/chat/completions`` 端点。
 
     每个后端都会在可用时解析 token 用量（如 ``response.usage`` 或等价字段），
     并将 token 统计和耗时记录到 MetricsStore。
 
     ``config`` 可以是完整的 :class:`Config` 或单独的 :class:`LLMConfig`。
-    传入 ``LLMConfig`` 时需同时提供 ``api_key``。
+    传入 ``LLMConfig`` 时，除 ``codex-cli`` 外需同时提供 ``api_key``。
 
     Args:
         prompt: 用户消息内容。
@@ -413,7 +417,7 @@ def call_llm(
         :class:`LLMResult` 包含内容、token 统计和耗时。
 
     Raises:
-        RuntimeError: 未配置 API key。
+        RuntimeError: 未配置 LLM 凭据，或 ``codex-cli`` 不可用。
         各后端 HTTP / SDK 客户端可能抛出的异常（如 ``requests.HTTPError`` 等）。
     """
     # Support both Config (has .llm attr) and LLMConfig (has .base_url directly)
@@ -426,10 +430,9 @@ def call_llm(
         llm_cfg = config.llm
         resolved_key = api_key or config.resolved_api_key()
 
-    if not resolved_key:
-        raise RuntimeError("未配置 LLM API key。")
-
     backend = llm_cfg.backend
+    if backend != "codex-cli" and not resolved_key:
+        raise RuntimeError("未配置 LLM API key。")
     _timeout = timeout or llm_cfg.timeout
 
     t0 = time.monotonic()
@@ -455,6 +458,14 @@ def call_llm(
                 system=system,
                 json_mode=json_mode,
                 max_tokens=max_tokens,
+                timeout=_timeout,
+            )
+        elif backend == "codex-cli":
+            content, tokens_in, tokens_out, tokens_total, model_name = _call_codex_cli(
+                prompt,
+                llm_cfg,
+                system=system,
+                json_mode=json_mode,
                 timeout=_timeout,
             )
         else:
@@ -500,6 +511,86 @@ def call_llm(
         model=model_name,
         duration_s=duration,
     )
+
+
+def _call_codex_cli(
+    prompt: str,
+    llm_cfg: LLMConfig,
+    *,
+    system: str | None,
+    json_mode: bool,
+    timeout: int,
+) -> tuple[str, int, int, int, str]:
+    """Call `codex exec` and reuse the local Codex login session."""
+    instructions = []
+    if system:
+        instructions.append(f"System instructions:\n{system}")
+    if json_mode:
+        instructions.append("You MUST respond with valid JSON only. No markdown fencing, no explanation.")
+    instructions.append(prompt)
+    final_prompt = "\n\n".join(instructions)
+
+    with tempfile.TemporaryDirectory(prefix="scholaraio-codex-") as tmpdir:
+        output_path = Path(tmpdir) / "last_message.txt"
+        cmd = [
+            "codex",
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--color",
+            "never",
+            "--output-last-message",
+            str(output_path),
+        ]
+        if llm_cfg.model:
+            cmd.extend(["--model", llm_cfg.model])
+        cmd.append(final_prompt)
+
+        env = os.environ.copy()
+        env.setdefault("NO_COLOR", "1")
+
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+                env=env,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("未找到 codex CLI。请先安装并运行 `codex login`。") from exc
+
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()
+            detail = detail[-1000:] if detail else f"exit code {proc.returncode}"
+            raise RuntimeError(f"codex exec 调用失败: {detail}")
+
+        content = output_path.read_text(encoding="utf-8").strip() if output_path.exists() else ""
+        if not content:
+            raise RuntimeError("codex exec 未返回最终消息。")
+
+        tokens_in = 0
+        tokens_out = 0
+        for line in proc.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = _json.loads(line)
+            except Exception:
+                continue
+            if event.get("type") == "turn.completed":
+                usage = event.get("usage") or {}
+                tokens_in = int(usage.get("input_tokens", 0) or 0)
+                tokens_out = int(usage.get("output_tokens", 0) or 0)
+                break
+
+        tokens_total = tokens_in + tokens_out
+        model_name = llm_cfg.model or "codex-cli"
+        return content, tokens_in, tokens_out, tokens_total, model_name
 
 
 def _call_openai_compat(
