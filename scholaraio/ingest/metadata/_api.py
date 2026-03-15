@@ -193,6 +193,117 @@ def _title_keywords(title: str, max_words: int = 8) -> str:
     return " ".join(significant[:max_words])
 
 
+def _normalize_lastname(name: str) -> str:
+    name = _extract_lastname(name).strip().lower()
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", name)
+
+
+def _is_generic_title(title: str) -> bool:
+    words = re.findall(r"\w+", title.lower())
+    generic = {
+        "study",
+        "review",
+        "article",
+        "dust",
+        "active",
+        "galactic",
+        "nuclei",
+        "quasar",
+        "quasars",
+        "spectral",
+        "energy",
+        "distribution",
+    }
+    if len(words) <= 5:
+        return True
+    non_generic = [w for w in words if w not in generic]
+    return len(non_generic) <= 2
+
+
+def _candidate_title(cr_data: dict, s2_data: dict, oa_data: dict) -> str:
+    if cr_data:
+        return ((cr_data.get("title") or [""]) or [""])[0]
+    if s2_data:
+        return s2_data.get("title", "")
+    if oa_data:
+        return oa_data.get("title", "")
+    return ""
+
+
+def _candidate_authors(cr_data: dict, s2_data: dict, oa_data: dict) -> list[str]:
+    if cr_data.get("author"):
+        return [f"{a.get('given', '')} {a.get('family', '')}".strip() for a in cr_data["author"]]
+    if s2_data.get("authors"):
+        return [a.get("name", "") for a in s2_data["authors"]]
+    if oa_data.get("authorships"):
+        return [a.get("author", {}).get("display_name", "") for a in oa_data["authorships"]]
+    return []
+
+
+def _candidate_year(cr_data: dict, s2_data: dict, oa_data: dict) -> int | None:
+    for date_key in ("published-print", "published-online"):
+        parts = cr_data.get(date_key, {}).get("date-parts", [[]])
+        if parts and parts[0] and parts[0][0]:
+            return parts[0][0]
+    if s2_data.get("year"):
+        return s2_data["year"]
+    if oa_data.get("publication_year"):
+        return oa_data["publication_year"]
+    return None
+
+
+def _candidate_journal(cr_data: dict, s2_data: dict, oa_data: dict) -> str:
+    ct = cr_data.get("container-title", [])
+    if ct:
+        return ct[0]
+    if s2_data.get("venue"):
+        return s2_data["venue"]
+    loc = oa_data.get("primary_location", {}) or {}
+    source = loc.get("source", {}) or {}
+    return source.get("display_name", "")
+
+
+def _trusted_api_match(
+    meta: PaperMetadata,
+    cr_data: dict,
+    s2_data: dict,
+    oa_data: dict,
+    *,
+    relaxed: bool = False,
+    doi_lookup: bool = False,
+) -> tuple[bool, str]:
+    api_title = _candidate_title(cr_data, s2_data, oa_data)
+    title_score = _fuzzy_title_match(meta.title, api_title) if (meta.title and api_title) else 1.0
+    api_authors = _candidate_authors(cr_data, s2_data, oa_data)
+    api_year = _candidate_year(cr_data, s2_data, oa_data)
+    api_journal = _candidate_journal(cr_data, s2_data, oa_data)
+
+    local_last = _normalize_lastname(meta.first_author or meta.first_author_lastname)
+    author_match = True
+    if local_last and api_authors:
+        author_match = local_last in {_normalize_lastname(a) for a in api_authors if a}
+
+    year_match = True
+    if meta.year and api_year:
+        year_match = abs(int(meta.year) - int(api_year)) <= (2 if doi_lookup else 1)
+
+    journal_match = True
+    if meta.journal and api_journal:
+        journal_match = _fuzzy_title_match(meta.journal, api_journal) >= (0.5 if doi_lookup else 0.6)
+
+    if title_score < (RELAXED_THRESHOLD if doi_lookup else TITLE_MATCH_THRESHOLD):
+        return False, f"title mismatch ({title_score:.2f})"
+    if relaxed and local_last and api_authors and not author_match:
+        return False, "author mismatch in relaxed title search"
+    if _is_generic_title(meta.title) and local_last and api_authors and not author_match:
+        return False, "generic title without author agreement"
+    if meta.year and api_year and not year_match and not author_match:
+        return False, "year and author mismatch"
+    if meta.journal and api_journal and not journal_match and not author_match and _is_generic_title(meta.title):
+        return False, "journal mismatch for generic title"
+    return True, ""
+
+
 # ============================================================================
 #  Relaxed Queries (Tier 3)
 # ============================================================================
@@ -293,16 +404,11 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
         s2_data = query_semantic_scholar(doi=meta.doi)
         oa_data = query_openalex(doi=meta.doi)
         if cr_data or s2_data or oa_data:
-            # Guard: verify API-returned title matches local title (prevent DOI hallucination)
-            api_title = (
-                (cr_data.get("title", [None]) or [None])[0]
-                if cr_data
-                else (s2_data.get("title") if s2_data else (oa_data.get("title") if oa_data else None))
-            )
-            title_score = _fuzzy_title_match(meta.title, api_title) if (meta.title and api_title) else 1.0
-            if title_score < RELAXED_THRESHOLD:
-                _log.debug("DOI title mismatch (score=%.2f), discarding DOI", title_score)
+            ok, reason = _trusted_api_match(meta, cr_data, s2_data, oa_data, doi_lookup=True)
+            if not ok:
+                _log.debug("DOI lookup rejected: %s", reason)
                 meta.doi = ""
+                meta.extraction_method = "metadata_conflict"
                 cr_data, s2_data, oa_data = {}, {}, {}
             else:
                 meta.extraction_method = "doi_lookup"
@@ -327,7 +433,13 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
                 oa_data = query_openalex(doi=found_doi)
 
         if cr_data or s2_data or oa_data:
-            meta.extraction_method = "title_search"
+            ok, reason = _trusted_api_match(meta, cr_data, s2_data, oa_data)
+            if ok:
+                meta.extraction_method = "title_search"
+            else:
+                _log.debug("title search rejected: %s", reason)
+                meta.extraction_method = "metadata_conflict"
+                cr_data, s2_data, oa_data = {}, {}, {}
 
     # ---- Tier 3: Relaxed title search (Crossref + OA, lower threshold) ----
     if not cr_data and not s2_data and not oa_data and meta.title:
@@ -345,14 +457,26 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
             s2_data = query_semantic_scholar(doi=found_doi)
 
         if cr_data or s2_data or oa_data:
-            meta.extraction_method = "title_search_relaxed"
+            ok, reason = _trusted_api_match(meta, cr_data, s2_data, oa_data, relaxed=True)
+            if ok:
+                meta.extraction_method = "title_search_relaxed"
+            else:
+                _log.debug("relaxed title search rejected: %s", reason)
+                meta.extraction_method = "metadata_conflict"
+                cr_data, s2_data, oa_data = {}, {}, {}
 
     # ---- Tier 4: S2 title search (last resort, may be rate-limited) ----
     if not cr_data and not s2_data and not oa_data and meta.title:
         _log.debug("Trying S2 title search (last resort)")
         s2_data = query_semantic_scholar(title=meta.title)
         if s2_data:
-            meta.extraction_method = "title_search_s2"
+            ok, reason = _trusted_api_match(meta, {}, s2_data, {}, relaxed=True)
+            if not ok:
+                _log.debug("S2 title search rejected: %s", reason)
+                meta.extraction_method = "metadata_conflict"
+                s2_data = {}
+            else:
+                meta.extraction_method = "title_search_s2"
 
     # ---- Tier 5: local_only ----
     if not cr_data and not s2_data and not oa_data:

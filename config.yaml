@@ -12,7 +12,7 @@ paths:
 #   anthropic:     ANTHROPIC_API_KEY
 #   google:        GOOGLE_API_KEY / GEMINI_API_KEY
 llm:
-  backend: openai-compat # openai-compat | anthropic | google
+  backend: openai-compat # openai-compat | anthropic | google | codex-cli
   model: deepseek-chat
   base_url: https://api.deepseek.com
   api_key: null # → config.local.yaml
@@ -41,6 +41,11 @@ llm:
 #   backend: google
 #   model: gemini-2.5-flash
 #   base_url: https://generativelanguage.googleapis.com
+#
+# OpenAI Codex CLI login:
+#   backend: codex-cli
+#   model: gpt-5-codex
+#   base_url: ""  # unused
 #
 # Local Ollama:
 #   backend: openai-compat

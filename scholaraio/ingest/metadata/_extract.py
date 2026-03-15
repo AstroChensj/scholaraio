@@ -402,9 +402,20 @@ def _extract_lastname(full_name: str) -> str:
         return ""
     name = full_name.strip()
 
-    # Chinese name: first character is surname
-    if re.search(r"[\u4e00-\u9fff]", name):
-        return name[0]
+    # Remove parenthetical glosses/affiliations and footnote markers first.
+    name = re.sub(r"\([^)]*\)", " ", name)
+    name = re.sub(r"\[[^\]]*\]", " ", name)
+    name = re.sub(r"[,;]\s*$", "", name)
+    name = re.sub(r"\s*\d+\s*$", "", name)
+
+    # Prefer Latin-script surname extraction when present, even if the name
+    # also contains CJK annotations like "Yan-Fei Jiang (燕)" or "Y. Jiang 姜".
+    latin = re.sub(r"[\u4e00-\u9fff]", " ", name)
+    latin = re.sub(r"\s+", " ", latin).strip()
+    if latin:
+        name = latin
+    elif re.search(r"[\u4e00-\u9fff]", name):
+        return re.sub(r"[^\u4e00-\u9fff]", "", name)[:1]
 
     parts = name.split()
     if not parts:
@@ -422,4 +433,7 @@ def _extract_lastname(full_name: str) -> str:
     if len(parts) >= 3 and parts[-2].lower() in particles:
         return parts[-2].capitalize() + " " + parts[-1]
 
-    return parts[-1]
+    lastname = parts[-1]
+    if len(lastname) == 1 and len(parts) >= 2:
+        lastname = parts[-2]
+    return lastname.rstrip(".")

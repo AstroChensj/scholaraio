@@ -30,6 +30,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from scholaraio.log import ui
+
 if TYPE_CHECKING:
     from scholaraio.config import Config
 
@@ -313,17 +315,23 @@ def enrich_l3(
         return True
 
     lines = md_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    if inspect:
+        ui(f"  [inspect] loaded paper.md: {len(lines)} lines")
 
     conclusion = method = None
 
     # --- Try locating conclusion via existing TOC (skip first LLM call) ---
     toc = data.get("toc")
     if toc:
+        if inspect:
+            ui(f"  [inspect] TOC available: {len(toc)} entries")
         conclusion, method = _l3_from_toc(lines, toc, config, max_retries, inspect)
 
     # --- Primary path (when TOC is unavailable) ---
     if conclusion is None:
         headers = _extract_headers(lines)
+        if inspect:
+            ui(f"  [inspect] primary path: {len(headers)} markdown headers")
         _log.debug("[Primary] found %d headers", len(headers))
         for h in headers:
             _log.debug("  line %4d  %s %s", h["line"], "#" * h["level"], h["text"])
@@ -332,6 +340,8 @@ def enrich_l3(
 
     # --- Fallback path ---
     if conclusion is None:
+        if inspect:
+            ui("  [inspect] fallback path: sending first 100 + last 200 lines")
         _log.debug("[Fallback] Primary path failed, switching to fallback")
         conclusion, method = _fallback_path(lines, config, max_retries, inspect)
 
@@ -388,6 +398,11 @@ def _l3_from_toc(
             found = True
 
     extracted = _slice_lines(lines, start_line, end_line)
+    if inspect:
+        ui(
+            f"  [inspect] TOC slice: lines {start_line}-{end_line or 'EOF'}, "
+            f"{_count_lines(extracted)} lines, {len(extracted)} chars"
+        )
     _log.debug("[TOC] extracted lines %d-%s, %d chars", start_line, end_line or "EOF", len(extracted))
 
     cleaned, reason = _validate_and_clean(extracted, config)
@@ -448,12 +463,24 @@ def _primary_path(
         'Return JSON only: {"line": <line_number>, "header": "<header_text>"}\n'
         'If no conclusion section exists, return: {"line": null, "header": null}'
     )
+    if inspect:
+        ui(
+            f"  [inspect] primary prompt: {len(headers)} headers, "
+            f"{_count_lines(prompt)} lines, {len(prompt)} chars"
+        )
 
     # 1 initial attempt + max_retries retries; range(1, ...) so attempt number is 1-based
     for attempt in range(1, max_retries + 2):
         try:
+            if inspect:
+                ui(f"  [inspect] primary attempt {attempt}: waiting for LLM")
             result = _parse_json(_call_llm(prompt, config))
             start_line = result.get("line")
+            if inspect:
+                ui(
+                    f"  [inspect] primary attempt {attempt}: "
+                    f"line={start_line!r}, header={result.get('header')!r}"
+                )
             if not start_line:
                 _log.debug("[Primary #%d] LLM found no conclusion", attempt)
                 return None, None
@@ -467,12 +494,19 @@ def _primary_path(
                     break
 
             extracted = _slice_lines(lines, start_line, end_line)
+            if inspect:
+                ui(
+                    f"  [inspect] primary slice: lines {start_line}-{end_line or 'EOF'}, "
+                    f"{_count_lines(extracted)} lines, {len(extracted)} chars"
+                )
             _log.debug(
                 "[Primary #%d] extracted lines %d-%s, %d chars", attempt, start_line, end_line or "EOF", len(extracted)
             )
 
-            cleaned, reason = _validate_and_clean(extracted, config)
+            cleaned, reason = _validate_and_clean(extracted, config, inspect=inspect)
             _log.debug("[Primary #%d] validate: %s %s", attempt, "PASS" if cleaned else "FAIL", reason)
+            if inspect:
+                ui(f"  [inspect] primary validate: {'PASS' if cleaned else 'FAIL'} {reason}")
             if cleaned:
                 return cleaned, f"primary-attempt{attempt}"
 
@@ -512,24 +546,37 @@ def _fallback_path(
         'Return JSON only: {"start_line": <N>, "end_line": <N>}\n'
         'If no conclusion exists, return: {"start_line": null, "end_line": null}'
     )
+    if inspect:
+        ui(f"  [inspect] fallback prompt: {_count_lines(prompt)} lines, {len(prompt)} chars")
 
     # 1 initial attempt + max_retries retries; range(1, ...) so attempt number is 1-based
     for attempt in range(1, max_retries + 2):
         try:
+            if inspect:
+                ui(f"  [inspect] fallback attempt {attempt}: waiting for LLM")
             result = _parse_json(_call_llm(prompt, config))
             start_line = result.get("start_line")
             end_line = result.get("end_line")
+            if inspect:
+                ui(f"  [inspect] fallback attempt {attempt}: start={start_line!r}, end={end_line!r}")
             if not start_line:
                 _log.debug("[Fallback #%d] LLM found no conclusion", attempt)
                 return None, None
 
             extracted = _slice_lines(lines, start_line, end_line)
+            if inspect:
+                ui(
+                    f"  [inspect] fallback slice: lines {start_line}-{end_line or 'EOF'}, "
+                    f"{_count_lines(extracted)} lines, {len(extracted)} chars"
+                )
             _log.debug(
                 "[Fallback #%d] extracted lines %d-%s, %d chars", attempt, start_line, end_line or "EOF", len(extracted)
             )
 
-            cleaned, reason = _validate_and_clean(extracted, config)
+            cleaned, reason = _validate_and_clean(extracted, config, inspect=inspect)
             _log.debug("[Fallback #%d] validate: %s %s", attempt, "PASS" if cleaned else "FAIL", reason)
+            if inspect:
+                ui(f"  [inspect] fallback validate: {'PASS' if cleaned else 'FAIL'} {reason}")
             if cleaned:
                 return cleaned, f"fallback-attempt{attempt}"
 
@@ -544,7 +591,7 @@ def _fallback_path(
 # ============================================================================
 
 
-def _validate_and_clean(text: str, config: Config) -> tuple[str | None, str]:
+def _validate_and_clean(text: str, config: Config, *, inspect: bool = False) -> tuple[str | None, str]:
     """校验并清理提取的结论文本。
 
     返回 (cleaned_text, reason)：
@@ -569,7 +616,14 @@ def _validate_and_clean(text: str, config: Config) -> tuple[str | None, str]:
         f"{text}\n\n"
         'Return JSON only: {"conclusion": "<cleaned text or null>", "reason": "<one sentence>"}'
     )
+    if inspect:
+        ui(
+            f"  [inspect] clean prompt: {_count_lines(text)} input lines, {len(text)} input chars, "
+            f"{_count_lines(prompt)} prompt lines, {len(prompt)} prompt chars"
+        )
     try:
+        if inspect:
+            ui("  [inspect] clean step: waiting for LLM")
         result = _parse_json(_call_llm(prompt, config, timeout=config.llm.timeout_clean))
         cleaned = result.get("conclusion")
         reason = result.get("reason") or ""
@@ -616,3 +670,10 @@ def _slice_lines(lines: list[str], start: int, end: int | None) -> str:
     s = max(0, start - 1)
     e = end if end is not None else len(lines)
     return "\n".join(lines[s:e]).strip()
+
+
+def _count_lines(text: str) -> int:
+    """Return the number of lines in a possibly empty text block."""
+    if not text:
+        return 0
+    return text.count("\n") + 1

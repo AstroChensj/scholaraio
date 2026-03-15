@@ -368,6 +368,26 @@ def step_dedup(ctx: InboxCtx) -> StepResult:
         ctx.meta.extraction_method = "local_only"
         _log.debug("skipping API query (offline mode)")
 
+    if ctx.meta.extraction_method == "metadata_conflict":
+        _log.debug("metadata conflict detected, moving to pending")
+        _move_to_pending(
+            ctx,
+            issue="metadata_conflict",
+            message="提取元数据与 API 返回结果冲突，需人工确认后再入库",
+        )
+        ctx.status = "needs_review"
+        return StepResult.FAIL
+
+    if _is_probable_supplement(ctx):
+        _log.debug("supplement detected, moving to pending")
+        _move_to_pending(
+            ctx,
+            issue="supplement",
+            message="检测到补充材料/附录，默认不作为独立论文自动入库",
+        )
+        ctx.status = "needs_review"
+        return StepResult.FAIL
+
     # DOI dedup (guard against LLM returning "null"/"None" strings)
     doi = ctx.meta.doi
     if doi and doi.strip().lower() in ("null", "none", "n/a"):
@@ -1758,6 +1778,58 @@ def _move_to_pending(
         marker["extracted_metadata"] = metadata_to_dict(ctx.meta)
     (paper_d / "pending.json").write_text(json.dumps(marker, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     _log.debug("-> pending/%s/ (%s)", dir_name, issue)
+
+
+def _is_probable_supplement(ctx: InboxCtx) -> bool:
+    """Heuristic detection for supplementary materials / appendices."""
+    strong_markers = (
+        "supplement",
+        "supplementary",
+        "supplemental",
+        "supporting information",
+        "extended data",
+    )
+    title_markers = strong_markers + ("appendix",)
+
+    filenames = []
+    if ctx.pdf_path:
+        filenames.append(ctx.pdf_path.name.lower())
+    if ctx.md_path:
+        filenames.append(ctx.md_path.name.lower())
+    if any(any(m in name for m in title_markers) or re.search(r"(^|[_-])supp([_-]|$)", name) for name in filenames):
+        return True
+
+    if not ctx.md_path or not ctx.md_path.exists():
+        return False
+
+    try:
+        lines = ctx.md_path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+
+    title_candidates: list[str] = []
+    nonempty = [line.strip() for line in lines[:30] if line.strip()]
+    for line in nonempty[:5]:
+        lowered = line.lower().lstrip("#").strip()
+        if lowered in {"abstract", "# abstract"}:
+            break
+        if line.lstrip().startswith("#"):
+            title_candidates.append(lowered)
+            break
+        title_candidates.append(lowered)
+        if len(title_candidates) >= 2:
+            break
+
+    def _looks_like_supp_title(text: str) -> bool:
+        if not text:
+            return False
+        if any(marker in text for marker in strong_markers):
+            return True
+        if re.match(r"^(appendix|appendices)\b", text):
+            return True
+        return False
+
+    return any(_looks_like_supp_title(text) for text in title_candidates)
 
 
 def _repair_abstract(json_path: Path, md_path: Path, cfg: Config) -> None:

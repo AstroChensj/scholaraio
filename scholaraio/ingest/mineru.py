@@ -805,9 +805,14 @@ def _flatten_assets(src_dir: Path, out_dir: Path, data_id: str) -> None:
             shutil.rmtree(str(images_dst))
         images_src.rename(images_dst)
 
-    # Move other assets (layout.json, content_list.json, origin.pdf)
+    # Move other assets (layout.json, content_list.json). Skip origin PDFs:
+    # they are just MinerU echoes of the input PDF and would be mistaken for
+    # fresh inbox items on the next pipeline run.
     for f in src_dir.iterdir():
         if f.is_file():
+            if f.suffix.lower() == ".pdf" and "origin" in f.stem.lower():
+                f.unlink(missing_ok=True)
+                continue
             dest = out_dir / f"{data_id}_{f.name}"
             f.rename(dest)
 
@@ -833,6 +838,17 @@ def _download_cloud_result(item: dict, out_dir: Path) -> str | None:
     Returns:
         Markdown text, or ``None`` on failure.
     """
+    def _direct_get(url: str, *, timeout: int):
+        # requests.get(..., proxies={...}) is not sufficient in some proxy
+        # environments; use a dedicated session with trust_env=False so CDN
+        # downloads bypass user-configured SOCKS/HTTP proxies completely.
+        sess = requests.Session()
+        sess.trust_env = False
+        try:
+            return sess.get(url, timeout=timeout)
+        finally:
+            sess.close()
+
     # Direct markdown content
     md = item.get("md_content")
     if isinstance(md, str) and md.strip():
@@ -846,7 +862,7 @@ def _download_cloud_result(item: dict, out_dir: Path) -> str | None:
             import zipfile
 
             # Bypass proxy for CDN downloads (domestic CDN through proxy causes SSL errors)
-            resp = requests.get(zip_url, timeout=120, proxies={"http": None, "https": None})
+            resp = _direct_get(zip_url, timeout=120)
             if resp.status_code == 200:
                 md_content = None
                 with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
@@ -868,7 +884,7 @@ def _download_cloud_result(item: dict, out_dir: Path) -> str | None:
     md_url = item.get("md_url")
     if md_url:
         try:
-            resp = requests.get(md_url, timeout=60, proxies={"http": None, "https": None})
+            resp = _direct_get(md_url, timeout=60)
             if resp.status_code == 200:
                 return resp.text
         except Exception as e:

@@ -559,6 +559,7 @@ def _call_codex_cli(
                 timeout=timeout,
                 check=False,
                 env=env,
+                cwd=tmpdir,
             )
         except FileNotFoundError as exc:
             raise RuntimeError("未找到 codex CLI。请先安装并运行 `codex login`。") from exc
