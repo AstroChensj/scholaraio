@@ -60,6 +60,8 @@ def metadata_to_dict(meta: PaperMetadata) -> dict:
         d["citation_count"]["semantic_scholar"] = meta.citation_count_s2
     if meta.citation_count_openalex is not None:
         d["citation_count"]["openalex"] = meta.citation_count_openalex
+    if meta.citation_count_ads is not None:
+        d["citation_count"]["ads"] = meta.citation_count_ads
     # IDs
     if meta.doi:
         d["ids"]["doi"] = meta.doi
@@ -74,6 +76,9 @@ def metadata_to_dict(meta: PaperMetadata) -> dict:
             if "openalex.org" in meta.openalex_id and "/works/" not in meta.openalex_id
             else meta.openalex_id
         )
+    if meta.ads_bibcode:
+        d["ids"]["ads_bibcode"] = meta.ads_bibcode
+        d["ids"]["ads_url"] = f"https://ui.adsabs.harvard.edu/abs/{meta.ads_bibcode}/abstract"
     return d
 
 
@@ -138,8 +143,16 @@ def refetch_metadata(json_path: Path) -> bool:
     meta.s2_paper_id = ids.get("semantic_scholar", "")
     meta.openalex_id = ids.get("openalex", "")
     meta.crossref_doi = ids.get("doi", "")
+    meta.ads_bibcode = ids.get("ads_bibcode", "")
 
-    enrich_metadata(meta)
+    try:
+        from scholaraio.config import load_config
+
+        cfg = load_config()
+    except Exception:
+        cfg = None
+
+    enrich_metadata(meta, cfg)
 
     new_data = metadata_to_dict(meta)
 

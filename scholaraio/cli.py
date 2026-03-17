@@ -448,7 +448,7 @@ def cmd_repair(args: argparse.Namespace, cfg) -> None:
         cli_lastname = meta.first_author_lastname
         cli_year = meta.year
 
-        meta = enrich_metadata(meta)
+        meta = enrich_metadata(meta, cfg)
 
         if cli_author and not meta.authors:
             meta.authors = [cli_author]
@@ -972,7 +972,15 @@ def cmd_explore(args: argparse.Namespace, cfg) -> None:
         # Determine name: explicit --name, or derive from filters
         name = args.name
         if not name:
-            if args.issn:
+            if getattr(args, "backend", "openalex") == "ads":
+                if args.keyword:
+                    name = args.keyword.replace(" ", "-")[:30]
+                elif args.author:
+                    name = f"ads-author-{args.author}"
+                else:
+                    ui("请提供 --name，或为 ADS 提供 --keyword / --author")
+                    return
+            elif args.issn:
                 name = args.issn.replace("-", "")
             elif args.concept:
                 name = f"concept-{args.concept}"
@@ -987,6 +995,7 @@ def cmd_explore(args: argparse.Namespace, cfg) -> None:
 
         total = fetch_explore(
             name,
+            backend=getattr(args, "backend", "openalex"),
             issn=getattr(args, "issn", None),
             concept=getattr(args, "concept", None),
             topic=getattr(args, "topic_id", None),
@@ -2591,13 +2600,14 @@ def main() -> None:
     p_explore.set_defaults(func=cmd_explore)
     p_explore_sub = p_explore.add_subparsers(dest="explore_action", required=True)
 
-    p_ef = p_explore_sub.add_parser("fetch", help="从 OpenAlex 拉取论文（多维度 filter）")
+    p_ef = p_explore_sub.add_parser("fetch", help="从 OpenAlex / ADS 拉取论文（多维度 filter）")
+    p_ef.add_argument("--backend", choices=["openalex", "ads"], default="openalex", help="数据源后端（默认 openalex）")
     p_ef.add_argument("--issn", default=None, help="期刊 ISSN（如 0022-1120）")
     p_ef.add_argument("--concept", default=None, help="OpenAlex concept ID（如 C62520636）")
     p_ef.add_argument("--topic-id", default=None, help="OpenAlex topic ID")
     p_ef.add_argument("--author", default=None, help="OpenAlex author ID")
     p_ef.add_argument("--institution", default=None, help="OpenAlex institution ID")
-    p_ef.add_argument("--keyword", default=None, help="标题/摘要关键词搜索")
+    p_ef.add_argument("--keyword", default=None, help="标题/摘要关键词搜索；ADS 后端下可直接传 ADS 查询字符串")
     p_ef.add_argument("--source-type", default=None, help="来源类型（journal/conference/repository）")
     p_ef.add_argument("--oa-type", default=None, help="论文类型（article/review 等）")
     p_ef.add_argument("--min-citations", type=int, default=None, help="最小引用量")

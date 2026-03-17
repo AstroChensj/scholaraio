@@ -30,9 +30,11 @@ class PaperMetadata:
         citation_count_s2: Semantic Scholar 引用数。
         citation_count_openalex: OpenAlex 引用数。
         citation_count_crossref: Crossref 引用数。
+        citation_count_ads: ADS 引用数。
         s2_paper_id: Semantic Scholar 论文 ID。
         openalex_id: OpenAlex 论文 ID。
         crossref_doi: Crossref 返回的 DOI。
+        ads_bibcode: ADS bibcode。
         api_sources: 成功返回数据的 API 列表。
         references: 参考文献 DOI 列表（从 Semantic Scholar 获取）。
         source_file: 原始文件名。
@@ -53,9 +55,11 @@ class PaperMetadata:
     citation_count_s2: int | None = None
     citation_count_openalex: int | None = None
     citation_count_crossref: int | None = None
+    citation_count_ads: int | None = None
     s2_paper_id: str = ""
     openalex_id: str = ""
     crossref_doi: str = ""
+    ads_bibcode: str = ""
     api_sources: list[str] = field(default_factory=list)  # which APIs returned data
     references: list[str] = field(default_factory=list)  # reference DOIs from S2
     volume: str = ""

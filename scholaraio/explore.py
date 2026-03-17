@@ -100,6 +100,11 @@ def _meta_path(name: str, cfg: Config | None = None) -> Path:
     return _explore_dir(name, cfg) / "meta.json"
 
 
+def _paper_pid(p: dict) -> str:
+    """Return the stable record ID used inside explore datasets."""
+    return (p.get("doi") or "").lower() or p.get("openalex_id", "") or p.get("ads_bibcode", "")
+
+
 # ============================================================================
 #  Fetch from OpenAlex
 # ============================================================================
@@ -112,7 +117,12 @@ def _is_boilerplate(abstract: str) -> bool:
 
 
 _OA_WORKS = "https://api.openalex.org/works"
+_ADS_SEARCH = "https://api.adsabs.harvard.edu/v1/search/query"
 _PER_PAGE = 200
+_OPENALEX_SESSION = requests.Session()
+_OPENALEX_SESSION.trust_env = False
+_ADS_SESSION = requests.Session()
+_ADS_SESSION.trust_env = False
 
 
 def _reconstruct_abstract(inverted_index: dict | None) -> str:
@@ -175,6 +185,7 @@ def _fetch_page(
     *,
     cursor: str = "*",
     keyword: str | None = None,
+    openalex_api_key: str = "",
 ) -> tuple[list[dict], str | None]:
     """Fetch one page of results from OpenAlex.
 
@@ -183,6 +194,7 @@ def _fetch_page(
         extra_params: Additional query params (e.g. search).
         cursor: Cursor for pagination.
         keyword: Free-text search keyword (OpenAlex ``search`` param).
+        openalex_api_key: Optional OpenAlex API key.
     """
     params: dict[str, str | int] = {
         "per_page": _PER_PAGE,
@@ -195,13 +207,15 @@ def _fetch_page(
         params["filter"] = filt
     if keyword:
         params["search"] = keyword
+    if openalex_api_key:
+        params["api_key"] = openalex_api_key
     if extra_params:
         params.update(extra_params)
     # Retry with exponential backoff for transient errors
     last_exc: Exception | None = None
     for attempt in range(3):
         try:
-            resp = requests.get(_OA_WORKS, params=params, timeout=30, proxies={"http": None, "https": None})
+            resp = _OPENALEX_SESSION.get(_OA_WORKS, params=params, timeout=30)
             if resp.status_code == 429:
                 wait = 2**attempt
                 _log.warning("OpenAlex 429 rate limit, retrying in %ds", wait)
@@ -254,9 +268,119 @@ def _fetch_page(
     return papers, next_cursor
 
 
+def _build_ads_query(
+    *,
+    keyword: str | None = None,
+    author: str | None = None,
+    year_range: str | None = None,
+    min_citations: int | None = None,
+) -> str:
+    """Build a simple ADS query string.
+
+    ``keyword`` is treated as the base query and may already contain raw ADS
+    syntax. Additional filters are appended with ``AND`` when present.
+    """
+    parts: list[str] = []
+    if keyword:
+        parts.append(f"({keyword})")
+    if author:
+        escaped = author.replace('"', '\\"')
+        parts.append(f'author:"{escaped}"')
+    if year_range:
+        if "-" in year_range:
+            start, end = year_range.split("-", 1)
+            start = start.strip() or "*"
+            end = end.strip() or "*"
+            parts.append(f"year:[{start} TO {end}]")
+        else:
+            parts.append(f"year:{year_range.strip()}")
+    if min_citations is not None:
+        parts.append(f"citation_count:[{min_citations} TO *]")
+    return " AND ".join(parts)
+
+
+def _fetch_ads_page(
+    query: str,
+    ads_api_token: str,
+    *,
+    start: int = 0,
+) -> tuple[list[dict], int]:
+    """Fetch one page of results from ADS search API."""
+    params = {
+        "q": query,
+        "rows": _PER_PAGE,
+        "start": start,
+        "fl": "bibcode,title,author,year,doi,abstract,citation_count,pub,doctype",
+        "sort": "date asc",
+    }
+    headers = {"Authorization": f"Bearer {ads_api_token}"}
+
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            resp = _ADS_SESSION.get(_ADS_SEARCH, params=params, headers=headers, timeout=30)
+            if resp.status_code == 429:
+                wait = 2**attempt
+                _log.warning("ADS 429 rate limit, retrying in %ds", wait)
+                time.sleep(wait)
+                continue
+            resp.raise_for_status()
+            data = resp.json()
+            break
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_exc = e
+            wait = 2**attempt
+            _log.warning("ADS request failed (attempt %d/3): %s, retrying in %ds", attempt + 1, e, wait)
+            time.sleep(wait)
+    else:
+        if last_exc:
+            raise last_exc
+        raise requests.HTTPError("ADS API failed after 3 retries")
+
+    docs = data.get("response", {}).get("docs", [])
+    total_found = int(data.get("response", {}).get("numFound", 0) or 0)
+    papers: list[dict] = []
+    for item in docs:
+        doi_val = item.get("doi") or []
+        if isinstance(doi_val, list):
+            doi = doi_val[0] if doi_val else ""
+        else:
+            doi = str(doi_val or "")
+        title_val = item.get("title") or []
+        if isinstance(title_val, list):
+            title = title_val[0] if title_val else ""
+        else:
+            title = str(title_val or "")
+        abstract = item.get("abstract") or ""
+        authors = item.get("author") or []
+        if not isinstance(authors, list):
+            authors = [str(authors)]
+        year_raw = item.get("year")
+        try:
+            year = int(year_raw) if year_raw is not None else None
+        except (TypeError, ValueError):
+            year = None
+        papers.append(
+            {
+                "ads_bibcode": item.get("bibcode", ""),
+                "doi": doi.replace("https://doi.org/", ""),
+                "title": title,
+                "abstract": abstract,
+                "authors": authors,
+                "year": year,
+                "cited_by_count": int(item.get("citation_count", 0) or 0),
+                "type": item.get("doctype", ""),
+                "journal": item.get("pub", ""),
+            }
+        )
+
+    return papers, total_found
+
+
 def fetch_explore(
     name: str,
     *,
+    backend: str = "openalex",
     issn: str | None = None,
     concept: str | None = None,
     topic: str | None = None,
@@ -309,14 +433,31 @@ def fetch_explore(
         min_citations=min_citations,
         oa_type=oa_type,
     )
-    if not filt and not keyword:
-        raise ValueError("至少需要一个过滤条件（issn / concept / author / keyword 等）")
+    if backend == "ads":
+        if issn or concept or topic or institution or source_type or oa_type:
+            raise ValueError("ADS 后端当前仅支持 keyword / author / year-range / min-citations")
+        ads_api_token = cfg.resolved_ads_api_token() if cfg is not None else ""
+        if not ads_api_token:
+            raise ValueError("ADS 后端需要 API token。请在 config.local.yaml 中设置 explore.ads_api_token 或环境变量 ADS_API_TOKEN")
+        ads_query = _build_ads_query(
+            keyword=keyword,
+            author=author,
+            year_range=year_range,
+            min_citations=min_citations,
+        )
+        if not ads_query.strip():
+            raise ValueError("ADS 后端至少需要 --keyword 或 --author")
+    else:
+        ads_api_token = ""
+        ads_query = ""
+        if not filt and not keyword:
+            raise ValueError("至少需要一个过滤条件（issn / concept / author / keyword 等）")
 
-    # Incremental mode: load existing IDs (DOI or openalex_id) to skip duplicates
+    # Incremental mode: load existing IDs (DOI / OpenAlex / ADS) to skip duplicates
     existing_pids: set[str] = set()
     if incremental and papers_file.exists():
         for p in iter_papers(name, cfg):
-            pid = p.get("doi", "").lower() or p.get("openalex_id", "")
+            pid = _paper_pid(p)
             if pid:
                 existing_pids.add(pid)
         _log.info("incremental mode: %d existing papers loaded", len(existing_pids))
@@ -325,6 +466,9 @@ def fetch_explore(
 
     total = 0
     cursor: str | None = "*"
+    openalex_api_key = cfg.resolved_openalex_api_key() if cfg is not None else ""
+    ads_start = 0
+    ads_total_found: int | None = None
 
     with timer("explore.fetch", "api") as t:
         if incremental and papers_file.exists():
@@ -335,29 +479,38 @@ def fetch_explore(
 
         try:
             page = 0
-            while cursor:
+            while True:
                 page += 1
-                papers, cursor = _fetch_page(
-                    filt,
-                    extra_params,
-                    cursor=cursor,
-                    keyword=keyword,
-                )
+                if backend == "ads":
+                    papers, ads_total_found = _fetch_ads_page(ads_query, ads_api_token, start=ads_start)
+                    ads_start += len(papers)
+                else:
+                    if not cursor:
+                        break
+                    papers, cursor = _fetch_page(
+                        filt,
+                        extra_params,
+                        cursor=cursor,
+                        keyword=keyword,
+                        openalex_api_key=openalex_api_key,
+                    )
                 if not papers:
                     break
                 for p in papers:
-                    # Skip duplicates in incremental mode (by DOI or openalex_id)
+                    # Skip duplicates in incremental mode (by DOI / OpenAlex / ADS ID)
                     if incremental:
-                        pid = p.get("doi", "").lower() or p.get("openalex_id", "")
+                        pid = _paper_pid(p)
                         if pid and pid in existing_pids:
                             continue
                     f_handle.write(json.dumps(p, ensure_ascii=False) + "\n")
                     total += 1
                     if incremental:
-                        pid = p.get("doi", "").lower() or p.get("openalex_id", "")
+                        pid = _paper_pid(p)
                         if pid:
                             existing_pids.add(pid)
                 _log.info("page %d: +%d papers (total %d, %.0fs)", page, len(papers), total, t.elapsed)
+                if backend == "ads" and ads_total_found is not None and ads_start >= ads_total_found:
+                    break
         finally:
             f_handle.close()
 
@@ -367,6 +520,7 @@ def fetch_explore(
     # Build query record for meta.json
     query_params: dict[str, str | int | None] = {}
     for key, val in [
+        ("backend", backend),
         ("issn", issn),
         ("concept", concept),
         ("topic", topic),
@@ -389,7 +543,7 @@ def fetch_explore(
 
     meta = {
         "name": name,
-        "source": "openalex",
+        "source": backend,
         "query": query_params,
         # Keep "issn" at top level for backward compatibility
         "issn": issn or "",
@@ -483,7 +637,7 @@ def build_explore_vectors(name: str, *, rebuild: bool = False, cfg: Config | Non
 
         to_embed: list[tuple[str, str]] = []
         for p in iter_papers(name, cfg):
-            pid = p.get("doi") or p.get("openalex_id", "")
+            pid = _paper_pid(p)
             if not pid or pid in existing:
                 continue
             title = (p.get("title") or "").strip()
@@ -551,11 +705,11 @@ def build_papers_map(name: str, cfg: Config | None = None) -> dict[str, dict]:
         cfg: 可选的全局配置。
 
     Returns:
-        ``{paper_id: paper_dict}`` 映射，paper_id 为 DOI 或 openalex_id。
+        ``{paper_id: paper_dict}`` 映射，paper_id 为 DOI / OpenAlex ID / ADS bibcode。
     """
     pm: dict[str, dict] = {}
     for p in iter_papers(name, cfg):
-        pid = p.get("doi") or p.get("openalex_id", "")
+        pid = _paper_pid(p)
         if pid:
             pm[pid] = p
     return pm
@@ -658,10 +812,13 @@ def explore_vsearch(name: str, query: str, *, top_k: int = 10, cfg: Config | Non
     Returns:
         论文列表，按 cosine similarity 降序。
     """
-    from scholaraio.vectors import _vsearch_faiss
+    import numpy as np
 
+    from scholaraio.vectors import _build_faiss_from_db, _embed_text, _search_faiss_by_vector
+
+    q_vec = np.array([_embed_text(query, cfg)], dtype="float32")
     index, paper_ids = _build_faiss_index(name, cfg)
-    hits = _vsearch_faiss(query, index, paper_ids, top_k, cfg=cfg)
+    hits = _search_faiss_by_vector(q_vec, index, paper_ids, top_k)
 
     paper_map = {}
     for p in iter_papers(name, cfg):
@@ -722,7 +879,7 @@ def build_explore_fts(name: str, *, rebuild: bool = False, cfg: Config | None = 
 
         count = 0
         for p in iter_papers(name, cfg):
-            pid = p.get("doi") or p.get("openalex_id", "")
+            pid = _paper_pid(p)
             if not pid or pid in existing:
                 continue
             title = (p.get("title") or "").strip()
@@ -828,13 +985,13 @@ def explore_unified_search(name: str, query: str, *, top_k: int = 20, cfg: Confi
     merged: dict[str, dict] = {}
 
     for rank, r in enumerate(fts_results):
-        pid = r.get("doi") or r.get("openalex_id", "")
+        pid = _paper_pid(r)
         if not pid:
             continue
         merged[pid] = {**r, "score": 1.0 / (rrf_k + rank + 1), "match": "fts"}
 
     for rank, r in enumerate(vec_results):
-        pid = r.get("doi") or r.get("openalex_id", "")
+        pid = _paper_pid(r)
         if not pid:
             continue
         rrf_score = 1.0 / (rrf_k + rank + 1)

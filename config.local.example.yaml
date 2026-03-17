@@ -19,6 +19,12 @@ ingest:
   mineru_api_key: ""
   contact_email: "" # Crossref polite pool — your email 你的邮箱（加速 Crossref 查询）
 
+# OpenAlex API key (optional, recommended for reliable explore fetch); check it from: https://openalex.org/settings/api-key
+# OpenAlex API 密钥（可选，但建议配置以稳定使用 explore fetch）
+explore:
+  openalex_api_key: ""
+  ads_api_token: ""
+
 # Zotero integration (optional) Zotero 集成（可选）
 # API key: https://www.zotero.org/settings/keys
 # Library ID: visible in your Zotero web library URL

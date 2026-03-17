@@ -357,7 +357,7 @@ def _compute_batch_size(est_tokens: int, profile: dict, safety_factor: float = 0
 
 def _embed_text(text: str, cfg: Config | None = None) -> list[float]:
     model = _load_model(cfg)
-    vec = model.encode([text], prompt_name="query", normalize_embeddings=True)
+    vec = model.encode([text], normalize_embeddings=True)
     return vec[0].tolist()
 
 
@@ -743,10 +743,26 @@ def _vsearch_faiss(
     Returns:
         List of ``(paper_id, score)`` sorted by descending similarity.
     """
-    import faiss
     import numpy as np
 
     q_vec = np.array([_embed_text(query, cfg)], dtype="float32")
+    return _search_faiss_by_vector(q_vec, index, paper_ids, top_k)
+
+
+def _search_faiss_by_vector(
+    q_vec,
+    index: faiss.Index,
+    paper_ids: list[str],
+    top_k: int,
+) -> list[tuple[str, float]]:
+    """Run a FAISS similarity search from a precomputed query vector."""
+    import faiss
+    import numpy as np
+
+    q_vec = np.asarray(q_vec, dtype="float32")
+    if q_vec.ndim == 1:
+        q_vec = q_vec.reshape(1, -1)
+
     faiss.normalize_L2(q_vec)
 
     fetch_k = min(top_k, index.ntotal)

@@ -402,6 +402,16 @@ def _extract_lastname(full_name: str) -> str:
         return ""
     name = full_name.strip()
 
+    # ADS and some bibliographic sources use "Family, Given" ordering.
+    # When a comma is present, prefer the token before the first comma.
+    if "," in name:
+        family = name.split(",", 1)[0].strip()
+        family = re.sub(r"\([^)]*\)", " ", family)
+        family = re.sub(r"\[[^\]]*\]", " ", family)
+        family = re.sub(r"\s+", " ", family).strip().rstrip(".")
+        if family:
+            return family
+
     # Remove parenthetical glosses/affiliations and footnote markers first.
     name = re.sub(r"\([^)]*\)", " ", name)
     name = re.sub(r"\[[^\]]*\]", " ", name)

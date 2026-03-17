@@ -20,6 +20,8 @@
 
 Your coding agent already reads code, writes code, and runs experiments. ScholarAIO gives it a structured knowledge base of your research papers — so the same agent that writes your code can also search your literature, cross-check results against published findings, reproduce methods from papers, and draft your manuscript. One terminal, one agent, the full research loop.
 
+TODO: `scholaraio citing XXX` supports online search
+
 <!-- TODO: Add demo GIF here -->
 <!-- <div align="center">
   <img src="docs/assets/demo.gif" width="700" alt="ScholarAIO Demo">
@@ -121,6 +123,7 @@ Main config: `config.yaml` (tracked). Secrets: `config.local.yaml` (gitignored).
 |-----|---------|--------|
 | LLM backend | Metadata extraction, enrichment, academic discussion | Set `llm.api_key` in `config.local.yaml`, or use env vars: `SCHOLARAIO_LLM_API_KEY` (universal), `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY` / `GEMINI_API_KEY`. Default backend: [DeepSeek](https://platform.deepseek.com/); also supports Claude, Gemini, Ollama, any OpenAI-compatible API, and local `codex login` via `llm.backend: codex-cli` |
 | `MINERU_API_KEY` | PDF → structured Markdown | Free at [mineru.net](https://mineru.net/apiManage/token) or [self-host](https://github.com/opendatalab/MinerU) |
+| `OPENALEX_API_KEY` | Reliable `explore fetch` from OpenAlex | Free at [OpenAlex](https://openalex.org/) or set `explore.openalex_api_key` in `config.local.yaml` |
 
 > **Both are optional.** Without LLM: regex-only extraction. Without MinerU: place `.md` files in `data/inbox/` directly.
 

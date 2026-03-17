@@ -91,6 +91,21 @@ class SearchConfig:
 
 
 @dataclass
+class ExploreConfig:
+    """External literature exploration configuration.
+
+    Attributes:
+        openalex_api_key: OpenAlex API key for ``explore fetch``.
+            Recommended in ``config.local.yaml`` or ``OPENALEX_API_KEY``.
+        ads_api_token: ADS API token for ``explore fetch --backend ads``.
+            Recommended in ``config.local.yaml`` or ``ADS_API_TOKEN``.
+    """
+
+    openalex_api_key: str = ""
+    ads_api_token: str = ""
+
+
+@dataclass
 class EmbedConfig:
     """语义向量嵌入配置。
 
@@ -197,6 +212,7 @@ class Config:
         paths: 文件路径配置。
         llm: LLM 后端配置。
         ingest: 数据入库配置。
+        explore: 外部文献探索配置。
         embed: 语义向量配置。
         search: 全文检索配置。
         topics: BERTopic 主题建模配置。
@@ -207,6 +223,7 @@ class Config:
     paths: PathsConfig = field(default_factory=PathsConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
     ingest: IngestConfig = field(default_factory=IngestConfig)
+    explore: ExploreConfig = field(default_factory=ExploreConfig)
     embed: EmbedConfig = field(default_factory=EmbedConfig)
     search: SearchConfig = field(default_factory=SearchConfig)
     topics: TopicsConfig = field(default_factory=TopicsConfig)
@@ -324,6 +341,34 @@ class Config:
             return self.ingest.mineru_api_key
         return os.environ.get("MINERU_API_KEY", "")
 
+    def resolved_openalex_api_key(self) -> str:
+        """Resolve OpenAlex API key for ``explore fetch``.
+
+        Lookup order:
+        1. config ``explore.openalex_api_key``
+        2. environment variable ``OPENALEX_API_KEY``
+
+        Returns:
+            API key string, or empty string when unset.
+        """
+        if self.explore.openalex_api_key:
+            return self.explore.openalex_api_key
+        return os.environ.get("OPENALEX_API_KEY", "")
+
+    def resolved_ads_api_token(self) -> str:
+        """Resolve ADS API token for ``explore fetch --backend ads``.
+
+        Lookup order:
+        1. config ``explore.ads_api_token``
+        2. environment variable ``ADS_API_TOKEN``
+
+        Returns:
+            ADS API token, or empty string when unset.
+        """
+        if self.explore.ads_api_token:
+            return self.explore.ads_api_token
+        return os.environ.get("ADS_API_TOKEN", "")
+
 
 # ============================================================================
 #  Loading
@@ -433,6 +478,12 @@ def _build_config(data: dict, root: Path) -> Config:
         chunk_page_limit=int(ingest_data.get("chunk_page_limit") or 100),
     )
 
+    explore_data = data.get("explore", {}) or {}
+    explore = ExploreConfig(
+        openalex_api_key=explore_data.get("openalex_api_key") or "",
+        ads_api_token=explore_data.get("ads_api_token") or "",
+    )
+
     embed_data = data.get("embed", {}) or {}
     embed = EmbedConfig(
         model=embed_data.get("model", "Qwen/Qwen3-Embedding-0.6B"),
@@ -474,6 +525,7 @@ def _build_config(data: dict, root: Path) -> Config:
         paths=paths,
         llm=llm,
         ingest=ingest,
+        explore=explore,
         embed=embed,
         search=search,
         topics=topics,

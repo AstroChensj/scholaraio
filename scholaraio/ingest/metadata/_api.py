@@ -1,4 +1,4 @@
-"""API query functions (Crossref, Semantic Scholar, OpenAlex) and metadata enrichment."""
+"""API query functions (Crossref, Semantic Scholar, OpenAlex, ADS) and metadata enrichment."""
 
 from __future__ import annotations
 
@@ -8,6 +8,8 @@ import time
 from urllib.parse import urlencode
 
 import requests
+
+from scholaraio.config import Config
 
 from ._extract import _extract_lastname
 from ._models import (
@@ -23,6 +25,7 @@ from ._models import (
 )
 
 _log = logging.getLogger(__name__)
+ADS_BASE = "https://api.adsabs.harvard.edu/v1/search/query"
 
 
 # ============================================================================
@@ -140,6 +143,55 @@ def query_crossref(doi: str = "", title: str = "") -> dict:
     else:
         return {}
 
+
+def query_ads(*, bibcode: str = "", doi: str = "", title: str = "", ads_api_token: str = "") -> dict:
+    """Query ADS search API by bibcode, DOI, or title.
+
+    Args:
+        bibcode: ADS bibcode (highest priority).
+        doi: DOI identifier.
+        title: Paper title.
+        ads_api_token: ADS API token.
+
+    Returns:
+        ADS document dict, or empty dict when not found / unavailable.
+    """
+    if not ads_api_token:
+        return {}
+
+    if bibcode:
+        query = f'bibcode:"{bibcode}"'
+    elif doi:
+        query = f'doi:"{doi}"'
+    elif title:
+        escaped = title.replace('"', '\\"')
+        query = f'title:"{escaped}"'
+    else:
+        return {}
+
+    params = {
+        "q": query,
+        "rows": "3",
+        "fl": "bibcode,title,author,year,doi,abstract,citation_count,pub,doctype",
+    }
+    headers = {"Authorization": f"Bearer {ads_api_token}"}
+    try:
+        resp = SESSION.get(ADS_BASE, params=params, headers=headers, timeout=TIMEOUT)
+        if resp.status_code == 404:
+            return {}
+        resp.raise_for_status()
+        docs = resp.json().get("response", {}).get("docs", [])
+        if doi or bibcode:
+            return docs[0] if docs else {}
+        for item in docs:
+            item_title = _ads_title(item)
+            if title and _fuzzy_title_match(title, item_title) >= TITLE_MATCH_THRESHOLD:
+                return item
+        return {}
+    except (requests.RequestException, ValueError, KeyError, IndexError) as e:
+        _log.warning("[ADS] %s", e)
+        return {}
+
     try:
         resp = SESSION.get(url, timeout=TIMEOUT)
         if resp.status_code == 404:
@@ -220,7 +272,16 @@ def _is_generic_title(title: str) -> bool:
     return len(non_generic) <= 2
 
 
-def _candidate_title(cr_data: dict, s2_data: dict, oa_data: dict) -> str:
+def _ads_title(ads_data: dict) -> str:
+    title_val = ads_data.get("title") or []
+    if isinstance(title_val, list):
+        return title_val[0] if title_val else ""
+    return title_val or ""
+
+
+def _candidate_title(ads_data: dict, cr_data: dict, s2_data: dict, oa_data: dict) -> str:
+    if ads_data:
+        return _ads_title(ads_data)
     if cr_data:
         return ((cr_data.get("title") or [""]) or [""])[0]
     if s2_data:
@@ -230,7 +291,9 @@ def _candidate_title(cr_data: dict, s2_data: dict, oa_data: dict) -> str:
     return ""
 
 
-def _candidate_authors(cr_data: dict, s2_data: dict, oa_data: dict) -> list[str]:
+def _candidate_authors(ads_data: dict, cr_data: dict, s2_data: dict, oa_data: dict) -> list[str]:
+    if ads_data.get("author"):
+        return ads_data.get("author") or []
     if cr_data.get("author"):
         return [f"{a.get('given', '')} {a.get('family', '')}".strip() for a in cr_data["author"]]
     if s2_data.get("authors"):
@@ -240,7 +303,12 @@ def _candidate_authors(cr_data: dict, s2_data: dict, oa_data: dict) -> list[str]
     return []
 
 
-def _candidate_year(cr_data: dict, s2_data: dict, oa_data: dict) -> int | None:
+def _candidate_year(ads_data: dict, cr_data: dict, s2_data: dict, oa_data: dict) -> int | None:
+    if ads_data.get("year"):
+        try:
+            return int(ads_data["year"])
+        except (TypeError, ValueError):
+            pass
     for date_key in ("published-print", "published-online"):
         parts = cr_data.get(date_key, {}).get("date-parts", [[]])
         if parts and parts[0] and parts[0][0]:
@@ -252,7 +320,9 @@ def _candidate_year(cr_data: dict, s2_data: dict, oa_data: dict) -> int | None:
     return None
 
 
-def _candidate_journal(cr_data: dict, s2_data: dict, oa_data: dict) -> str:
+def _candidate_journal(ads_data: dict, cr_data: dict, s2_data: dict, oa_data: dict) -> str:
+    if ads_data.get("pub"):
+        return ads_data["pub"]
     ct = cr_data.get("container-title", [])
     if ct:
         return ct[0]
@@ -265,6 +335,7 @@ def _candidate_journal(cr_data: dict, s2_data: dict, oa_data: dict) -> str:
 
 def _trusted_api_match(
     meta: PaperMetadata,
+    ads_data: dict,
     cr_data: dict,
     s2_data: dict,
     oa_data: dict,
@@ -272,11 +343,11 @@ def _trusted_api_match(
     relaxed: bool = False,
     doi_lookup: bool = False,
 ) -> tuple[bool, str]:
-    api_title = _candidate_title(cr_data, s2_data, oa_data)
+    api_title = _candidate_title(ads_data, cr_data, s2_data, oa_data)
     title_score = _fuzzy_title_match(meta.title, api_title) if (meta.title and api_title) else 1.0
-    api_authors = _candidate_authors(cr_data, s2_data, oa_data)
-    api_year = _candidate_year(cr_data, s2_data, oa_data)
-    api_journal = _candidate_journal(cr_data, s2_data, oa_data)
+    api_authors = _candidate_authors(ads_data, cr_data, s2_data, oa_data)
+    api_year = _candidate_year(ads_data, cr_data, s2_data, oa_data)
+    api_journal = _candidate_journal(ads_data, cr_data, s2_data, oa_data)
 
     local_last = _normalize_lastname(meta.first_author or meta.first_author_lastname)
     author_match = True
@@ -376,7 +447,7 @@ def _reconstruct_oa_abstract(inverted_index: dict) -> str:
     return " ".join(w for _, w in word_positions)
 
 
-def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
+def enrich_metadata(meta: PaperMetadata, cfg: Config | None = None) -> PaperMetadata:
     """通过 API 查询补全和覆盖元数据。
 
     查询策略（多层降级）:
@@ -394,28 +465,32 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
     Returns:
         同一个 :class:`PaperMetadata` 实例，字段已被 API 数据覆盖/补全。
     """
+    ads_data: dict = {}
     cr_data: dict = {}
     s2_data: dict = {}
     oa_data: dict = {}
+    ads_api_token = cfg.resolved_ads_api_token() if cfg is not None else ""
 
     # ---- Tier 1: DOI lookup (all three, DOI queries are not rate-limited) ----
     if meta.doi:
+        ads_data = query_ads(doi=meta.doi, ads_api_token=ads_api_token)
         cr_data = query_crossref(doi=meta.doi)
         s2_data = query_semantic_scholar(doi=meta.doi)
         oa_data = query_openalex(doi=meta.doi)
-        if cr_data or s2_data or oa_data:
-            ok, reason = _trusted_api_match(meta, cr_data, s2_data, oa_data, doi_lookup=True)
+        if ads_data or cr_data or s2_data or oa_data:
+            ok, reason = _trusted_api_match(meta, ads_data, cr_data, s2_data, oa_data, doi_lookup=True)
             if not ok:
                 _log.debug("DOI lookup rejected: %s", reason)
                 meta.doi = ""
                 meta.extraction_method = "metadata_conflict"
-                cr_data, s2_data, oa_data = {}, {}, {}
+                ads_data, cr_data, s2_data, oa_data = {}, {}, {}, {}
             else:
                 meta.extraction_method = "doi_lookup"
 
     # ---- Tier 2: Title search via Crossref + OA (no rate limit) ----
-    if not cr_data and not s2_data and not oa_data and meta.title:
+    if not ads_data and not cr_data and not s2_data and not oa_data and meta.title:
         _log.debug("No DOI match, trying title search")
+        ads_data = query_ads(title=meta.title, ads_api_token=ads_api_token)
         cr_data = query_crossref(title=meta.title)
         oa_data = query_openalex(title=meta.title)
 
@@ -432,18 +507,19 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
             if not oa_data:
                 oa_data = query_openalex(doi=found_doi)
 
-        if cr_data or s2_data or oa_data:
-            ok, reason = _trusted_api_match(meta, cr_data, s2_data, oa_data)
+        if ads_data or cr_data or s2_data or oa_data:
+            ok, reason = _trusted_api_match(meta, ads_data, cr_data, s2_data, oa_data)
             if ok:
                 meta.extraction_method = "title_search"
             else:
                 _log.debug("title search rejected: %s", reason)
                 meta.extraction_method = "metadata_conflict"
-                cr_data, s2_data, oa_data = {}, {}, {}
+                ads_data, cr_data, s2_data, oa_data = {}, {}, {}, {}
 
     # ---- Tier 3: Relaxed title search (Crossref + OA, lower threshold) ----
-    if not cr_data and not s2_data and not oa_data and meta.title:
+    if not ads_data and not cr_data and not s2_data and not oa_data and meta.title:
         _log.debug("Strict match failed, trying relaxed search")
+        ads_data = query_ads(title=meta.title, ads_api_token=ads_api_token)
         cr_data = _query_crossref_relaxed(meta.title)
         oa_data = _query_oa_relaxed(meta.title)
 
@@ -456,21 +532,21 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
         if found_doi and not s2_data:
             s2_data = query_semantic_scholar(doi=found_doi)
 
-        if cr_data or s2_data or oa_data:
-            ok, reason = _trusted_api_match(meta, cr_data, s2_data, oa_data, relaxed=True)
+        if ads_data or cr_data or s2_data or oa_data:
+            ok, reason = _trusted_api_match(meta, ads_data, cr_data, s2_data, oa_data, relaxed=True)
             if ok:
                 meta.extraction_method = "title_search_relaxed"
             else:
                 _log.debug("relaxed title search rejected: %s", reason)
                 meta.extraction_method = "metadata_conflict"
-                cr_data, s2_data, oa_data = {}, {}, {}
+                ads_data, cr_data, s2_data, oa_data = {}, {}, {}, {}
 
     # ---- Tier 4: S2 title search (last resort, may be rate-limited) ----
-    if not cr_data and not s2_data and not oa_data and meta.title:
+    if not ads_data and not cr_data and not s2_data and not oa_data and meta.title:
         _log.debug("Trying S2 title search (last resort)")
         s2_data = query_semantic_scholar(title=meta.title)
         if s2_data:
-            ok, reason = _trusted_api_match(meta, {}, s2_data, {}, relaxed=True)
+            ok, reason = _trusted_api_match(meta, {}, {}, s2_data, {}, relaxed=True)
             if not ok:
                 _log.debug("S2 title search rejected: %s", reason)
                 meta.extraction_method = "metadata_conflict"
@@ -479,7 +555,7 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
                 meta.extraction_method = "title_search_s2"
 
     # ---- Tier 5: local_only ----
-    if not cr_data and not s2_data and not oa_data:
+    if not ads_data and not cr_data and not s2_data and not oa_data:
         meta.extraction_method = meta.extraction_method or "local_only"
         return meta
 
@@ -487,7 +563,38 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
     # Priority for authors/title/year/journal: Crossref > S2 > OA > md fallback
     # For DOI/IDs/citations: always collect from all sources
 
-    # ---- 1. Crossref (highest quality for journal/authors/type) ----
+    # ---- 1. ADS (high priority for bib metadata and citations; especially strong in astronomy) ----
+    if ads_data:
+        meta.api_sources.append("ads")
+        meta.citation_count_ads = ads_data.get("citation_count")
+        if ads_data.get("bibcode"):
+            meta.ads_bibcode = ads_data["bibcode"]
+        doi_vals = ads_data.get("doi") or []
+        if not meta.doi:
+            if isinstance(doi_vals, list) and doi_vals:
+                meta.doi = doi_vals[0]
+            elif isinstance(doi_vals, str):
+                meta.doi = doi_vals
+        if ads_data.get("year"):
+            try:
+                meta.year = int(ads_data["year"])
+            except (TypeError, ValueError):
+                pass
+        ads_title = _ads_title(ads_data)
+        if ads_title:
+            meta.title = ads_title
+        if ads_data.get("pub"):
+            meta.journal = ads_data["pub"]
+        if ads_data.get("author"):
+            meta.authors = ads_data["author"]
+            meta.first_author = meta.authors[0]
+            meta.first_author_lastname = _extract_lastname(meta.first_author)
+        if ads_data.get("doctype") and not meta.paper_type:
+            meta.paper_type = ads_data["doctype"]
+        if ads_data.get("abstract") and not meta.abstract:
+            meta.abstract = ads_data["abstract"]
+
+    # ---- 2. Crossref (highest quality for journal/authors/type among general metadata sources) ----
     if cr_data:
         meta.api_sources.append("crossref")
         meta.citation_count_crossref = cr_data.get("is-referenced-by-count")
@@ -502,14 +609,14 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
                 break
         # Title — Crossref is authoritative, override md-extracted title
         cr_titles = cr_data.get("title", [])
-        if cr_titles and cr_titles[0]:
+        if cr_titles and cr_titles[0] and not ads_data:
             meta.title = cr_titles[0]
         # Journal (Crossref has standardized container-title)
         ct = cr_data.get("container-title", [])
-        if ct:
+        if ct and not ads_data:
             meta.journal = ct[0]
         # Authors — Crossref is the most authoritative (has structured given/family)
-        if cr_data.get("author"):
+        if cr_data.get("author") and not ads_data.get("author"):
             meta.authors = [f"{a.get('given', '')} {a.get('family', '')}".strip() for a in cr_data["author"]]
             meta.first_author = meta.authors[0]
             # Use Crossref's structured family name directly (handles double
@@ -537,7 +644,7 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
             elif isinstance(issns, str):
                 meta.issn = issns
 
-    # ---- 2. Semantic Scholar (best abstract, good authors) ----
+    # ---- 3. Semantic Scholar (best abstract, good authors) ----
     if s2_data:
         meta.api_sources.append("semantic_scholar")
         meta.citation_count_s2 = s2_data.get("citationCount")
@@ -545,14 +652,14 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
         if not meta.doi and s2_data.get("externalIds", {}).get("DOI"):
             meta.doi = s2_data["externalIds"]["DOI"]
         # Title: override only if Crossref didn't provide one
-        if not cr_data and s2_data.get("title"):
+        if not ads_data and not cr_data and s2_data.get("title"):
             meta.title = s2_data["title"]
         if not meta.year and s2_data.get("year"):
             meta.year = s2_data["year"]
         if not meta.journal and s2_data.get("venue"):
             meta.journal = s2_data["venue"]
         # Authors: override only if Crossref didn't provide them
-        if not cr_data and s2_data.get("authors"):
+        if not ads_data and not cr_data and s2_data.get("authors"):
             meta.authors = [a.get("name", "") for a in s2_data["authors"]]
             if meta.authors:
                 meta.first_author = meta.authors[0]
@@ -574,7 +681,7 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
             if ref_dois:
                 meta.references = ref_dois
 
-    # ---- 3. Crossref abstract (strip HTML/JATS tags, collapse whitespace) ----
+    # ---- 4. Crossref abstract (strip HTML/JATS tags, collapse whitespace) ----
     if cr_data and not meta.abstract and cr_data.get("abstract"):
         raw = cr_data["abstract"]
         raw = re.sub(r"<[^>]+>", "", raw)  # strip HTML/JATS tags
@@ -582,7 +689,7 @@ def enrich_metadata(meta: PaperMetadata) -> PaperMetadata:
         raw = re.sub(r"\s{2,}", " ", raw)  # collapse multiple spaces
         meta.abstract = raw.strip()
 
-    # ---- 4. OpenAlex (fallback for everything) ----
+    # ---- 5. OpenAlex (fallback for everything) ----
     if oa_data:
         meta.api_sources.append("openalex")
         meta.citation_count_openalex = oa_data.get("cited_by_count")

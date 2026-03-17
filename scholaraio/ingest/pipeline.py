@@ -362,7 +362,7 @@ def step_dedup(ctx: InboxCtx) -> StepResult:
     # API query
     if not ctx.opts.get("no_api"):
         _log.debug("querying APIs")
-        ctx.meta = enrich_metadata(ctx.meta)
+        ctx.meta = enrich_metadata(ctx.meta, ctx.cfg)
         ui(f"DOI (after API): {ctx.meta.doi or 'none'}")
     else:
         ctx.meta.extraction_method = "local_only"
