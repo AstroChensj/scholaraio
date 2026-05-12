@@ -556,6 +556,7 @@ def unified_search(
     journal: str | None = None,
     paper_type: str | None = None,
     paper_ids: set[str] | None = None,
+    exclude_terms: list[str] | None = None,
 ) -> list[dict]:
     """融合检索：FTS5 关键词 + FAISS 语义向量，合并去重排序。
 
@@ -574,6 +575,7 @@ def unified_search(
         journal: 期刊名过滤。
         paper_type: 论文类型过滤。
         paper_ids: 论文 UUID 白名单，仅返回集合内的结果。
+        exclude_terms: 负向短语列表，仅用于排序降权，不做硬过滤。
 
     Returns:
         论文字典列表，按综合得分降序。每项包含 ``paper_id``, ``title``,
@@ -613,6 +615,7 @@ def unified_search(
             journal=journal,
             paper_type=paper_type,
             paper_ids=paper_ids,
+            exclude_terms=exclude_terms,
         )
     except (FileNotFoundError, ImportError):
         pass
@@ -645,6 +648,41 @@ def unified_search(
             }
 
     results = sorted(merged.values(), key=lambda x: x["score"], reverse=True)
+
+    if exclude_terms and results:
+        from scholaraio.vectors import _rerank_semantic_results
+
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.row_factory = sqlite3.Row
+            meta_rows = conn.execute(
+                "SELECT paper_id, abstract, conclusion FROM papers WHERE paper_id IN (%s)"
+                % ",".join("?" * len(results)),
+                [r["paper_id"] for r in results],
+            ).fetchall()
+            text_map = {row["paper_id"]: dict(row) for row in meta_rows}
+        finally:
+            conn.close()
+
+        enriched = []
+        for r in results:
+            extra = text_map.get(r["paper_id"], {})
+            enriched.append({**r, "abstract": extra.get("abstract", ""), "conclusion": extra.get("conclusion", "")})
+
+        results = _rerank_semantic_results(query, enriched, exclude_terms=exclude_terms)
+        trimmed = []
+        for r in results[:top_k]:
+            item = dict(r)
+            item.pop("abstract", None)
+            item.pop("conclusion", None)
+            item.pop("_raw_score", None)
+            item.pop("_coverage", None)
+            item.pop("_phrase_hits", None)
+            item.pop("_neg_overlap", None)
+            item.pop("_neg_phrase_hits", None)
+            trimmed.append(item)
+        return trimmed
+
     return results[:top_k]
 
 

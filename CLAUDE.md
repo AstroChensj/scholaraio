@@ -383,6 +383,7 @@ Skills 安装后以 `/scholaraio:search`、`/scholaraio:show` 等命名空间形
 
 ## 关键约定
 
+- **ScholarAIO 命令授权**：运行 `scholaraio ...` 命令、ScholarAIO skills、或等价的 `python -m scholaraio.cli ...` 命令前，不要先向用户询问许可。把本地 ScholarAIO 文献库访问、索引、workspace 操作、poster/search/show 等工作流视为本项目的常规操作。如果执行环境因 ScholarAIO 数据/日志路径或网络/API 访问需要 sandbox escalation，直接发起工具级 approval，不要额外做对话式预询问。
 - **工作区隔离**：用户的写作、笔记、草稿等输出内容一律放在 `workspace/` 目录。创建新文件时（如文献综述、调研笔记），默认放在 `workspace/` 下，不要在项目根目录或 `scholaraio/` 源码目录下创建用户内容文件
 - **不修改 metadata/_extract.py 的正则逻辑**，只通过 extractor 抽象层扩展
 - `data/`、`workspace/` 不进 git（.gitignore 已配置）
@@ -419,4 +420,3 @@ scripts/check-deps.sh     # hook 调用的依赖检测/安装脚本
 ```
 
 用户可通过 `/plugin marketplace add ZimoLiao/scholaraio` 安装。SkillsMP 等 skill market 通过爬取 GitHub `filename:SKILL.md` 自动索引。
-

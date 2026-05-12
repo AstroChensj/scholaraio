@@ -101,6 +101,13 @@ def _add_filter_args(parser: argparse.ArgumentParser) -> None:
         dest="paper_type",
         help="论文类型过滤：review / journal-article 等（模糊匹配）",
     )
+    parser.add_argument(
+        "--not",
+        dest="exclude_terms",
+        action="append",
+        default=None,
+        help='负向短语（重复可多次），仅用于排序降权，如 --not "LRD"',
+    )
 
 
 def _resolve_ws_paper_ids(args: argparse.Namespace, cfg) -> set[str] | None:
@@ -325,6 +332,7 @@ def cmd_vsearch(args: argparse.Namespace, cfg) -> None:
             year=args.year,
             journal=args.journal,
             paper_type=args.paper_type,
+            exclude_terms=args.exclude_terms,
         )
     except FileNotFoundError as e:
         _log.error("%s", e)
@@ -360,6 +368,7 @@ def cmd_usearch(args: argparse.Namespace, cfg) -> None:
         year=args.year,
         journal=args.journal,
         paper_type=args.paper_type,
+        exclude_terms=args.exclude_terms,
     )
     elapsed = time.monotonic() - t0
     store = get_store()
@@ -1010,6 +1019,38 @@ def cmd_explore(args: argparse.Namespace, cfg) -> None:
             cfg=cfg,
         )
         ui(f"\nFetched {total} papers")
+
+    elif action == "trace":
+        name = args.name
+        if not name:
+            if args.keyword:
+                name = args.keyword.replace(" ", "-")[:30]
+            elif args.starting_paper:
+                name = f"trace-{str(args.starting_paper).replace(' ', '-')[:24]}"
+            else:
+                ui("请提供 --name，或至少提供 --keyword / --starting-paper")
+                return
+        from scholaraio.explore import trace_explore
+
+        total = trace_explore(
+            name,
+            starting_paper=args.starting_paper,
+            keyword=args.keyword,
+            rounds=args.rounds,
+            top_per_round=args.top_per_round,
+            year_range=args.year_range,
+            min_citations=args.min_citations,
+            forward=not args.no_forward,
+            backward=not args.no_backward,
+            cfg=cfg,
+        )
+        ui(f"\nTraced {total} papers")
+
+    elif action == "summarize":
+        from scholaraio.explore import summarize_trace
+
+        out = summarize_trace(args.name, cfg=cfg)
+        ui(f"Done: summary -> {out}")
 
     elif action == "embed":
         try:
@@ -2614,6 +2655,20 @@ def main() -> None:
     p_ef.add_argument("--name", help="探索库名称（默认从 filter 推导）")
     p_ef.add_argument("--year-range", help="年份过滤（如 2020-2025）")
     p_ef.add_argument("--incremental", action="store_true", help="增量更新（追加新论文）")
+
+    p_etrace = p_explore_sub.add_parser("trace", help="递归追踪 ADS 引用/被引树并按语义相关性筛选")
+    p_etrace.add_argument("--name", help="探索库名称（默认从 keyword 或起始论文推导）")
+    p_etrace.add_argument("--starting-paper", default=None, help="起始本地论文（目录名 / UUID / DOI）")
+    p_etrace.add_argument("--keyword", default=None, help="目标描述文本，用于语义排序")
+    p_etrace.add_argument("--rounds", type=int, default=2, help="递归轮数（默认 2）")
+    p_etrace.add_argument("--top-per-round", type=int, default=10, help="每轮全局保留前 N 篇（默认 10）")
+    p_etrace.add_argument("--year-range", default=None, help="年份过滤（如 2020-2025）")
+    p_etrace.add_argument("--min-citations", type=int, default=None, help="最小引用量过滤")
+    p_etrace.add_argument("--no-forward", action="store_true", help="关闭 forward trace（被引扩展）")
+    p_etrace.add_argument("--no-backward", action="store_true", help="关闭 backward trace（参考文献扩展）")
+
+    p_esum = p_explore_sub.add_parser("summarize", help="为 trace 结果生成 LLM Markdown 总结")
+    p_esum.add_argument("--name", required=True, help="trace 探索库名称")
 
     p_ee = p_explore_sub.add_parser("embed", help="为探索库生成语义向量")
     p_ee.add_argument("--name", required=True, help="探索库名称")

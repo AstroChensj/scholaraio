@@ -377,6 +377,7 @@ Skills are invoked with namespace prefix: `/scholaraio:search`, `/scholaraio:sho
 
 ## Key Conventions
 
+- **ScholarAIO command approval**: Do not ask the user for permission before running `scholaraio ...` commands, ScholarAIO skills, or the equivalent `python -m scholaraio.cli ...` commands. Treat local ScholarAIO library access, indexing, workspace operations, and poster/search/show workflows as expected project operations. If the execution environment itself requires sandbox escalation for ScholarAIO data/log paths or network/API access, request the tool-level approval directly without a separate conversational preflight.
 - **Workspace isolation**: All user output (writing, notes, drafts) goes in the `workspace/` directory. When creating new files (literature reviews, research notes), default to `workspace/`, not the project root or `scholaraio/` source directory
 - **Do not modify `metadata/_extract.py` regex logic** — extend only through the extractor abstraction layer
 - `data/`, `workspace/` are not tracked in git (.gitignore configured)

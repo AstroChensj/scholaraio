@@ -143,6 +143,29 @@ def query_crossref(doi: str = "", title: str = "") -> dict:
     else:
         return {}
 
+    try:
+        resp = SESSION.get(url, timeout=TIMEOUT)
+        if resp.status_code == 404:
+            return {}
+        resp.raise_for_status()
+        data = resp.json()
+
+        # DOI lookup returns {"message": {...}}
+        if doi:
+            return data.get("message", {})
+
+        # Title search returns {"message": {"items": [...]}}
+        items = data.get("message", {}).get("items", [])
+        for item in items:
+            cr_titles = item.get("title", [])
+            cr_title = cr_titles[0] if cr_titles else ""
+            if title and _fuzzy_title_match(title, cr_title) >= TITLE_MATCH_THRESHOLD:
+                return item
+        return {}
+    except (requests.RequestException, ValueError, KeyError) as e:
+        _log.warning("[CR] %s", e)
+        return {}
+
 
 def query_ads(*, bibcode: str = "", doi: str = "", title: str = "", ads_api_token: str = "") -> dict:
     """Query ADS search API by bibcode, DOI, or title.
@@ -171,7 +194,7 @@ def query_ads(*, bibcode: str = "", doi: str = "", title: str = "", ads_api_toke
 
     params = {
         "q": query,
-        "rows": "3",
+        "rows": "5",
         "fl": "bibcode,title,author,year,doi,abstract,citation_count,pub,doctype",
     }
     headers = {"Authorization": f"Bearer {ads_api_token}"}
@@ -183,38 +206,23 @@ def query_ads(*, bibcode: str = "", doi: str = "", title: str = "", ads_api_toke
         docs = resp.json().get("response", {}).get("docs", [])
         if doi or bibcode:
             return docs[0] if docs else {}
+        best_doc = {}
+        best_score = 0.0
         for item in docs:
             item_title = _ads_title(item)
-            if title and _fuzzy_title_match(title, item_title) >= TITLE_MATCH_THRESHOLD:
-                return item
+            score = _fuzzy_title_match(title, item_title) if title else 0.0
+            if score > best_score:
+                best_doc = item
+                best_score = score
+        # ADS often indexes preprint and journal variants with slightly different
+        # titles. Return the best relaxed match and let _trusted_api_match apply
+        # author/year/title validation before merge.
+        if best_score >= RELAXED_THRESHOLD:
+            return best_doc
         return {}
     except (requests.RequestException, ValueError, KeyError, IndexError) as e:
         _log.warning("[ADS] %s", e)
         return {}
-
-    try:
-        resp = SESSION.get(url, timeout=TIMEOUT)
-        if resp.status_code == 404:
-            return {}
-        resp.raise_for_status()
-        data = resp.json()
-
-        # DOI lookup returns {"message": {...}}
-        if doi:
-            return data.get("message", {})
-
-        # Title search returns {"message": {"items": [...]}}
-        items = data.get("message", {}).get("items", [])
-        for item in items:
-            cr_titles = item.get("title", [])
-            cr_title = cr_titles[0] if cr_titles else ""
-            if title and _fuzzy_title_match(title, cr_title) >= TITLE_MATCH_THRESHOLD:
-                return item
-        return {}
-    except (requests.RequestException, ValueError, KeyError) as e:
-        _log.warning("[CR] %s", e)
-        return {}
-
 
 # ============================================================================
 #  Helpers
@@ -279,7 +287,30 @@ def _ads_title(ads_data: dict) -> str:
     return title_val or ""
 
 
+def _api_dict(data: dict | None) -> dict:
+    """Normalize optional API payloads to dictionaries."""
+    return data if isinstance(data, dict) else {}
+
+
+def _ads_publication_year(ads_data: dict) -> int | None:
+    """Prefer ADS bibcode year as final journal year over generic year field."""
+    ads_data = _api_dict(ads_data)
+    bibcode = ads_data.get("bibcode", "") or ""
+    if len(bibcode) >= 4 and bibcode[:4].isdigit():
+        return int(bibcode[:4])
+    if ads_data.get("year"):
+        try:
+            return int(ads_data["year"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _candidate_title(ads_data: dict, cr_data: dict, s2_data: dict, oa_data: dict) -> str:
+    ads_data = _api_dict(ads_data)
+    cr_data = _api_dict(cr_data)
+    s2_data = _api_dict(s2_data)
+    oa_data = _api_dict(oa_data)
     if ads_data:
         return _ads_title(ads_data)
     if cr_data:
@@ -292,6 +323,10 @@ def _candidate_title(ads_data: dict, cr_data: dict, s2_data: dict, oa_data: dict
 
 
 def _candidate_authors(ads_data: dict, cr_data: dict, s2_data: dict, oa_data: dict) -> list[str]:
+    ads_data = _api_dict(ads_data)
+    cr_data = _api_dict(cr_data)
+    s2_data = _api_dict(s2_data)
+    oa_data = _api_dict(oa_data)
     if ads_data.get("author"):
         return ads_data.get("author") or []
     if cr_data.get("author"):
@@ -304,11 +339,13 @@ def _candidate_authors(ads_data: dict, cr_data: dict, s2_data: dict, oa_data: di
 
 
 def _candidate_year(ads_data: dict, cr_data: dict, s2_data: dict, oa_data: dict) -> int | None:
-    if ads_data.get("year"):
-        try:
-            return int(ads_data["year"])
-        except (TypeError, ValueError):
-            pass
+    ads_data = _api_dict(ads_data)
+    cr_data = _api_dict(cr_data)
+    s2_data = _api_dict(s2_data)
+    oa_data = _api_dict(oa_data)
+    ads_year = _ads_publication_year(ads_data)
+    if ads_year:
+        return ads_year
     for date_key in ("published-print", "published-online"):
         parts = cr_data.get(date_key, {}).get("date-parts", [[]])
         if parts and parts[0] and parts[0][0]:
@@ -320,7 +357,24 @@ def _candidate_year(ads_data: dict, cr_data: dict, s2_data: dict, oa_data: dict)
     return None
 
 
+def _crossref_years(cr_data: dict) -> tuple[int | None, int | None]:
+    """Return (published_print_year, published_online_year) from Crossref."""
+    cr_data = _api_dict(cr_data)
+
+    def _extract(date_key: str) -> int | None:
+        parts = cr_data.get(date_key, {}).get("date-parts", [[]])
+        if parts and parts[0] and parts[0][0]:
+            return parts[0][0]
+        return None
+
+    return _extract("published-print"), _extract("published-online")
+
+
 def _candidate_journal(ads_data: dict, cr_data: dict, s2_data: dict, oa_data: dict) -> str:
+    ads_data = _api_dict(ads_data)
+    cr_data = _api_dict(cr_data)
+    s2_data = _api_dict(s2_data)
+    oa_data = _api_dict(oa_data)
     if ads_data.get("pub"):
         return ads_data["pub"]
     ct = cr_data.get("container-title", [])
@@ -502,6 +556,8 @@ def enrich_metadata(meta: PaperMetadata, cfg: Config | None = None) -> PaperMeta
             found_doi = oa_data["doi"].replace("https://doi.org/", "")
 
         if found_doi:
+            if not ads_data:
+                ads_data = query_ads(doi=found_doi, ads_api_token=ads_api_token)
             if not s2_data:
                 s2_data = query_semantic_scholar(doi=found_doi)
             if not oa_data:
@@ -529,8 +585,11 @@ def enrich_metadata(meta: PaperMetadata, cfg: Config | None = None) -> PaperMeta
             found_doi = cr_data["DOI"]
         elif oa_data and oa_data.get("doi"):
             found_doi = oa_data["doi"].replace("https://doi.org/", "")
-        if found_doi and not s2_data:
-            s2_data = query_semantic_scholar(doi=found_doi)
+        if found_doi:
+            if not ads_data:
+                ads_data = query_ads(doi=found_doi, ads_api_token=ads_api_token)
+            if not s2_data:
+                s2_data = query_semantic_scholar(doi=found_doi)
 
         if ads_data or cr_data or s2_data or oa_data:
             ok, reason = _trusted_api_match(meta, ads_data, cr_data, s2_data, oa_data, relaxed=True)
@@ -575,11 +634,9 @@ def enrich_metadata(meta: PaperMetadata, cfg: Config | None = None) -> PaperMeta
                 meta.doi = doi_vals[0]
             elif isinstance(doi_vals, str):
                 meta.doi = doi_vals
-        if ads_data.get("year"):
-            try:
-                meta.year = int(ads_data["year"])
-            except (TypeError, ValueError):
-                pass
+        ads_year = _ads_publication_year(ads_data)
+        if ads_year:
+            meta.year = ads_year
         ads_title = _ads_title(ads_data)
         if ads_title:
             meta.title = ads_title
@@ -601,12 +658,14 @@ def enrich_metadata(meta: PaperMetadata, cfg: Config | None = None) -> PaperMeta
         if cr_data.get("DOI"):
             meta.doi = cr_data["DOI"]
         meta.crossref_doi = cr_data.get("DOI", "")
-        # Year: prefer published-print, fallback published-online
-        for date_key in ("published-print", "published-online"):
-            parts = cr_data.get(date_key, {}).get("date-parts", [[]])
-            if parts and parts[0] and parts[0][0]:
-                meta.year = parts[0][0]
-                break
+        # Year policy: prefer final journal citation year. For astronomy papers,
+        # ADS bibcode year is often the authoritative journal year even when
+        # Crossref dates reflect online/issue scheduling in the prior year.
+        published_print, published_online = _crossref_years(cr_data)
+        if published_print and not _ads_publication_year(ads_data):
+            meta.year = published_print
+        elif published_online and not _ads_publication_year(ads_data):
+            meta.year = published_online
         # Title — Crossref is authoritative, override md-extracted title
         cr_titles = cr_data.get("title", [])
         if cr_titles and cr_titles[0] and not ads_data:

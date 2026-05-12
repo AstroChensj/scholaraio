@@ -247,6 +247,7 @@ def vsearch(
     journal: str | None = None,
     paper_type: str | None = None,
     workspace: str | None = None,
+    exclude: list[str] | None = None,
 ) -> str:
     """Semantic vector search using Qwen3-Embedding (FAISS cosine similarity).
 
@@ -259,6 +260,7 @@ def vsearch(
         journal: Journal name filter.
         paper_type: Paper type filter.
         workspace: Optional workspace name.
+        exclude: Negative phrases for ranking-only downweighting.
     """
     try:
         from scholaraio.vectors import vsearch as _vsearch
@@ -278,6 +280,7 @@ def vsearch(
             journal=journal,
             paper_type=paper_type,
             paper_ids=paper_ids,
+            exclude_terms=exclude,
         )
         return json.dumps(results, ensure_ascii=False)
     except FileNotFoundError:
@@ -295,6 +298,7 @@ def unified_search(
     journal: str | None = None,
     paper_type: str | None = None,
     workspace: str | None = None,
+    exclude: list[str] | None = None,
 ) -> str:
     """Hybrid search combining FTS5 keywords and FAISS semantic vectors.
 
@@ -307,6 +311,7 @@ def unified_search(
         journal: Journal name filter.
         paper_type: Paper type filter.
         workspace: Optional workspace name.
+        exclude: Negative phrases for ranking-only downweighting.
     """
     try:
         from scholaraio.index import unified_search as _usearch
@@ -322,6 +327,7 @@ def unified_search(
             journal=journal,
             paper_type=paper_type,
             paper_ids=paper_ids,
+            exclude_terms=exclude,
         )
         return json.dumps(results, ensure_ascii=False)
     except FileNotFoundError:

@@ -18,6 +18,7 @@ import importlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import struct
 import time
@@ -40,6 +41,68 @@ CREATE TABLE IF NOT EXISTS paper_vectors (
 """
 
 _MIGRATE_HASH = "ALTER TABLE paper_vectors ADD COLUMN content_hash TEXT NOT NULL DEFAULT ''"
+_SEMANTIC_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "into",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "using",
+    "via",
+    "with",
+    "within",
+    "without",
+    "about",
+    "across",
+    "among",
+    "between",
+    "compared",
+    "comparison",
+    "different",
+    "general",
+    "generic",
+    "model",
+    "models",
+    "modelling",
+    "modeling",
+    "paper",
+    "papers",
+    "result",
+    "results",
+    "study",
+    "studies",
+    "type",
+    "types",
+    "normal",
+    "typical",
+    "spectral",
+    "spectrum",
+    "spectra",
+    "shape",
+    "shapes",
+    "property",
+    "properties",
+}
+_SEMANTIC_SPECIAL_TOKENS = {"agn", "blr", "sed", "uv", "xray"}
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -55,6 +118,162 @@ def _content_hash(title: str, abstract: str) -> str:
     """Compute a short hash of the embedding source text."""
     text = f"{title}\n\n{abstract}"
     return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _normalize_semantic_text(text: str) -> str:
+    """Normalize text for lightweight lexical alignment during semantic reranking."""
+    text = (text or "").lower()
+    text = re.sub(r"\bx[\s-]?ray\b", " xray ", text)
+    text = re.sub(r"\bsoft[\s-]?excess\b", " soft excess ", text)
+    text = re.sub(r"\bfe[\s-]?ii\b", " feii ", text)
+    text = re.sub(r"\bmg[\s-]?ii\b", " mgii ", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _semantic_tokens(text: str) -> list[str]:
+    """Tokenize normalized text into alphanumeric terms."""
+    norm = _normalize_semantic_text(text)
+    return re.findall(r"[a-z0-9]+", norm)
+
+
+def _informative_query_tokens(query: str) -> list[str]:
+    """Keep technical query anchors while dropping generic retrieval glue."""
+    tokens: list[str] = []
+    for tok in _semantic_tokens(query):
+        if tok in _SEMANTIC_STOPWORDS:
+            continue
+        if len(tok) >= 3 or tok in _SEMANTIC_SPECIAL_TOKENS:
+            tokens.append(tok)
+    return tokens
+
+
+def _token_weight(token: str) -> float:
+    """Assign larger weights to more specific technical anchors."""
+    if token in {"xray", "agn", "blr", "mgii", "feii"}:
+        return 1.3
+    if len(token) >= 8:
+        return 1.2
+    if len(token) >= 5:
+        return 1.0
+    return 0.8
+
+
+def _informative_query_phrases(query_tokens: list[str]) -> list[str]:
+    """Build short technical phrases that should outrank generic semantic neighbors."""
+    phrases: list[str] = []
+    for n in (2, 3):
+        for i in range(len(query_tokens) - n + 1):
+            phrase = " ".join(query_tokens[i : i + n])
+            if len(phrase) >= 8:
+                phrases.append(phrase)
+    # Deduplicate while preserving order.
+    return list(dict.fromkeys(phrases))
+
+
+def _lexical_alignment(query: str, doc_text: str) -> tuple[float, int]:
+    """Estimate how well a semantic hit matches the query's technical anchors.
+
+    Returns:
+        Tuple of ``(coverage, phrase_hits)`` where coverage is the weighted
+        fraction of informative query tokens found in the candidate document.
+    """
+    query_tokens = _informative_query_tokens(query)
+    if len(query_tokens) < 2:
+        return 0.0, 0
+
+    doc_norm = _normalize_semantic_text(doc_text)
+    doc_tokens = set(_semantic_tokens(doc_text))
+    total_weight = sum(_token_weight(tok) for tok in query_tokens)
+    hit_weight = sum(_token_weight(tok) for tok in query_tokens if tok in doc_tokens)
+    coverage = hit_weight / total_weight if total_weight else 0.0
+    phrase_hits = sum(1 for phrase in _informative_query_phrases(query_tokens) if phrase in doc_norm)
+    return coverage, phrase_hits
+
+
+def _negative_alignment(exclude_terms: list[str] | None, doc_text: str) -> tuple[float, int]:
+    """Estimate lexical overlap with explicit negative terms."""
+    if not exclude_terms:
+        return 0.0, 0
+
+    doc_norm = _normalize_semantic_text(doc_text)
+    doc_tokens = set(_semantic_tokens(doc_text))
+    total_weight = 0.0
+    hit_weight = 0.0
+    phrase_hits = 0
+
+    for term in exclude_terms:
+        toks = _informative_query_tokens(term)
+        if not toks:
+            continue
+        total_weight += sum(_token_weight(tok) for tok in toks)
+        hit_weight += sum(_token_weight(tok) for tok in toks if tok in doc_tokens)
+        for phrase in _informative_query_phrases(toks):
+            if phrase in doc_norm:
+                phrase_hits += 1
+
+    overlap = hit_weight / total_weight if total_weight else 0.0
+    return overlap, phrase_hits
+
+
+def _rerank_semantic_results(query: str, results: list[dict], *, exclude_terms: list[str] | None = None) -> list[dict]:
+    """Re-rank FAISS hits with lightweight lexical calibration.
+
+    Pure vector similarity is good at topic recall but can overvalue generic
+    phrasing such as "spectral shape" or "properties". We keep the semantic
+    ranking as the base signal and calibrate it with exact overlap on the
+    query's more technical anchors found in title/abstract/conclusion text.
+    """
+    query_tokens = _informative_query_tokens(query)
+    if len(query_tokens) < 2:
+        return results
+
+    rescored: list[dict] = []
+    for result in results:
+        doc_text = "\n".join(
+            p
+            for p in [
+                result.get("title", ""),
+                result.get("journal", ""),
+                result.get("abstract", ""),
+                result.get("conclusion", ""),
+            ]
+            if p
+        )
+        coverage, phrase_hits = _lexical_alignment(query, doc_text)
+        neg_overlap, neg_phrase_hits = _negative_alignment(exclude_terms, doc_text)
+        score = float(result.get("score", 0.0))
+        adjusted = score * (1.0 + 0.45 * coverage + 0.12 * phrase_hits)
+        if coverage < 0.18 and phrase_hits == 0:
+            adjusted *= 0.82
+        elif coverage < 0.30 and phrase_hits == 0:
+            adjusted *= 0.92
+        if neg_overlap > 0.0 or neg_phrase_hits > 0:
+            adjusted *= max(0.25, 1.0 - 0.55 * neg_overlap - 0.18 * neg_phrase_hits)
+
+        rescored.append(
+            {
+                **result,
+                "_raw_score": score,
+                "_coverage": coverage,
+                "_phrase_hits": phrase_hits,
+                "_neg_overlap": neg_overlap,
+                "_neg_phrase_hits": neg_phrase_hits,
+                "score": adjusted,
+            }
+        )
+
+    rescored.sort(
+        key=lambda r: (
+            r["score"],
+            r["_phrase_hits"],
+            -r["_neg_phrase_hits"],
+            r["_coverage"] - r["_neg_overlap"],
+            r["_raw_score"],
+        ),
+        reverse=True,
+    )
+    return rescored
 
 
 # ============================================================================
@@ -786,6 +1005,7 @@ def vsearch(
     journal: str | None = None,
     paper_type: str | None = None,
     paper_ids: set[str] | None = None,
+    exclude_terms: list[str] | None = None,
 ) -> list[dict]:
     """语义向量检索，使用 FAISS 加速余弦相似度搜索。
 
@@ -801,6 +1021,7 @@ def vsearch(
         journal: 期刊名过滤（LIKE 模糊匹配）。
         paper_type: 论文类型过滤（如 ``"review"``、``"journal-article"``）。
         paper_ids: 论文 UUID 白名单，仅返回集合内的结果。
+        exclude_terms: 负向短语列表，仅用于排序降权，不做硬过滤。
 
     Returns:
         论文字典列表，按 ``score`` 降序排列。每项包含
@@ -835,8 +1056,9 @@ def vsearch(
 
     index, faiss_ids = _build_faiss_index(db_path)
 
-    # Fetch more candidates when post-filtering is needed
-    fetch_k = top_k * 5 if (year or journal or paper_type or paper_ids) else top_k
+    # Fetch a broader candidate pool so lightweight lexical reranking can
+    # correct generic semantic neighbors before the final cut.
+    fetch_k = top_k * 5 if (year or journal or paper_type or paper_ids) else max(top_k * 8, 20)
     fetch_k = min(fetch_k, index.ntotal)
     scores, indices = index.search(q_vec, fetch_k)
 
@@ -848,7 +1070,7 @@ def vsearch(
         if has_fts:
             conn.row_factory = sqlite3.Row
             for row in conn.execute(
-                "SELECT paper_id, title, authors, year, journal, citation_count, paper_type FROM papers"
+                "SELECT paper_id, title, authors, year, journal, abstract, conclusion, citation_count, paper_type FROM papers"
             ).fetchall():
                 meta_map[row["paper_id"]] = dict(row)
         # Load dir_name mapping
@@ -886,8 +1108,20 @@ def vsearch(
         results = [r for r in results if r["paper_id"] in paper_ids]
     if year or journal or paper_type:
         results = _post_filter(results, year=year, journal=journal, paper_type=paper_type)
+    results = _rerank_semantic_results(query, results, exclude_terms=exclude_terms)
 
-    return results[:top_k]
+    trimmed = []
+    for r in results[:top_k]:
+        item = dict(r)
+        item.pop("abstract", None)
+        item.pop("conclusion", None)
+        item.pop("_raw_score", None)
+        item.pop("_coverage", None)
+        item.pop("_phrase_hits", None)
+        item.pop("_neg_overlap", None)
+        item.pop("_neg_phrase_hits", None)
+        trimmed.append(item)
+    return trimmed
 
 
 def _safe_year(r: dict) -> int | None:

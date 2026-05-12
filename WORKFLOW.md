@@ -33,7 +33,12 @@ No mandatory command yet. This is the planning stage.
 
 ## 2. Discover Papers From the Web
 
-ScholarAIO's `explore` workflow fetches metadata/abstracts from OpenAlex, then builds local embeddings on the fetched set.
+ScholarAIO's `explore` workflow fetches metadata/abstracts from external services, then builds local embeddings on the fetched set.
+
+Two common discovery modes:
+
+- `explore fetch`: broad OpenAlex/ADS metadata scouting from keyword and filter queries
+- `explore trace`: ADS citation-tree scouting from a seed paper, a natural-language description, or both
 
 Important:
 
@@ -77,6 +82,64 @@ Optional topic clustering:
 ```bash
 scholaraio explore topics --name agn-outflow --build
 ```
+
+### Recursive ADS Trace
+
+Use `explore trace` when you want to follow the citation neighborhood of a paper rather than only run a broad keyword search. It recursively expands through ADS backward references and forward citations, ranks candidates by abstract-level relevance plus citation impact, and writes the selected set to `data/explore/<name>/`.
+
+Trace outputs:
+
+- `papers.jsonl`: selected ADS papers with title, abstract, year, DOI, bibcode, and citation count when available
+- `meta.json`: trace parameters and run metadata
+- `trace_report.md`: human-readable round-by-round report
+
+Keyword-only trace:
+
+```bash
+scholaraio explore trace \
+  --name softxray-trace \
+  --keyword "soft X-ray excess spectral shape in normal AGN" \
+  --rounds 2 \
+  --top-per-round 10
+```
+
+Trace from a local paper:
+
+```bash
+scholaraio explore trace \
+  --name chen2025-trace \
+  --starting-paper Chen-2025-A-UV-to-X-Ray-View-of-Soft-Excess-in-Type-1-Active-Galactic-Nuclei-II-Broadband-Correlations \
+  --rounds 2 \
+  --top-per-round 10
+```
+
+Trace from a local paper, but steer the ranking with a specific scientific description:
+
+```bash
+scholaraio explore trace \
+  --name chen2025-softxray \
+  --starting-paper Chen-2025-A-UV-to-X-Ray-View-of-Soft-Excess-in-Type-1-Active-Galactic-Nuclei-II-Broadband-Correlations \
+  --keyword "soft X-ray excess spectral shape in normal AGN" \
+  --rounds 3 \
+  --top-per-round 15
+```
+
+After trace, the normal explore post-processing commands still apply:
+
+```bash
+scholaraio explore embed --name chen2025-softxray
+scholaraio explore search --name chen2025-softxray "warm corona" --mode semantic
+scholaraio explore topics --name chen2025-softxray --build
+scholaraio explore info --name chen2025-softxray
+```
+
+Optional LLM summary of a trace set:
+
+```bash
+scholaraio explore summarize --name chen2025-softxray
+```
+
+`explore summarize` reads `papers.jsonl` and `meta.json`, sends a fresh LLM query, and writes `summary.md`. It is an abstract-level synthesis of the trace result set, not a full-text synthesis from `paper.md`.
 
 
 ## 3. Pick Papers To Read Locally
@@ -228,6 +291,20 @@ Hybrid:
 ```bash
 scholaraio usearch "AGN multiscale outflow feedback"
 ```
+
+Downweight unwanted subtopics during ranking:
+
+```bash
+scholaraio vsearch "soft X-ray excess spectral shape in normal AGN" --not "little red dots" --not "v-shape"
+```
+
+The same ranking control works with hybrid search:
+
+```bash
+scholaraio usearch "AGN soft excess warm corona" --not "LRD"
+```
+
+`--not` is a soft downweighting signal, not a hard exclusion. A paper can still appear if it is strongly relevant to the positive query, but matches to unwanted subtopics are penalized.
 
 
 ## 7. Read Papers in Layers
@@ -392,12 +469,13 @@ If you want the simplest useful pattern:
 
 1. Start from an idea
 2. Optionally use `explore fetch -> explore embed -> explore search`
-3. Download a small number of strong candidate PDFs
-4. Put them in `data/inbox/`
-5. Run `scholaraio pipeline ingest`
-6. Run `scholaraio pipeline reindex`
-7. Use `search` / `vsearch` / `usearch`
-8. Ask Codex research questions based on your local papers
+3. Or use `explore trace -> explore summarize -> inspect candidates` for citation-tree discovery
+4. Download a small number of strong candidate PDFs
+5. Put them in `data/inbox/`
+6. Run `scholaraio pipeline ingest`
+7. Run `scholaraio pipeline reindex`
+8. Use `search` / `vsearch` / `usearch`
+9. Ask Codex research questions based on your local papers
 
 
 ## Practical Division of Labor

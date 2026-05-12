@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import sqlite3
 import time
@@ -123,6 +124,8 @@ _OPENALEX_SESSION = requests.Session()
 _OPENALEX_SESSION.trust_env = False
 _ADS_SESSION = requests.Session()
 _ADS_SESSION.trust_env = False
+_TRACE_REPORT = "trace_report.md"
+_TRACE_SUMMARY = "summary.md"
 
 
 def _reconstruct_abstract(inverted_index: dict | None) -> str:
@@ -304,14 +307,16 @@ def _fetch_ads_page(
     ads_api_token: str,
     *,
     start: int = 0,
+    rows: int = _PER_PAGE,
+    sort: str = "date asc",
 ) -> tuple[list[dict], int]:
     """Fetch one page of results from ADS search API."""
     params = {
         "q": query,
-        "rows": _PER_PAGE,
+        "rows": rows,
         "start": start,
         "fl": "bibcode,title,author,year,doi,abstract,citation_count,pub,doctype",
-        "sort": "date asc",
+        "sort": sort,
     }
     headers = {"Authorization": f"Bearer {ads_api_token}"}
 
@@ -375,6 +380,362 @@ def _fetch_ads_page(
         )
 
     return papers, total_found
+
+
+def _normalize_doi(doi: str | None) -> str:
+    return (doi or "").replace("https://doi.org/", "").strip().lower()
+
+
+def _trace_pid(p: dict) -> str:
+    return _normalize_doi(p.get("doi")) or p.get("ads_bibcode", "")
+
+
+def _resolve_local_seed(cfg: Config, paper_ref: str) -> tuple[dict, dict]:
+    """Resolve a local paper reference and return ``(meta, ads_seed_record)``."""
+    from scholaraio.cli import _resolve_paper
+    from scholaraio.papers import read_meta
+
+    paper_d = _resolve_paper(paper_ref, cfg)
+    meta = read_meta(paper_d)
+    ads_api_token = cfg.resolved_ads_api_token()
+    if not ads_api_token:
+        raise ValueError("ADS API token 未配置，无法执行 explore trace。")
+
+    queries: list[str] = []
+    ids = meta.get("ids") or {}
+    bibcode = ids.get("ads_bibcode") or meta.get("ads_bibcode") or ""
+    if bibcode:
+        queries.append(f"bibcode:{bibcode}")
+    doi = _normalize_doi(meta.get("doi"))
+    if doi:
+        queries.append(f'doi:"{doi}"')
+    title = (meta.get("title") or "").strip()
+    if title:
+        escaped = title.replace('"', '\\"')
+        queries.append(f'title:"{escaped}"')
+
+    for q in queries:
+        papers, _ = _fetch_ads_page(q, ads_api_token, rows=5, sort="citation_count desc")
+        if papers:
+            return meta, papers[0]
+    raise ValueError(f"无法在 ADS 中解析起始论文: {paper_ref}")
+
+
+def _build_trace_target_text(seed_meta: dict | None, keyword: str | None) -> str:
+    if keyword:
+        return keyword.strip()
+    if seed_meta:
+        title = (seed_meta.get("title") or "").strip()
+        abstract = (seed_meta.get("abstract") or "").strip()
+        return "\n\n".join(p for p in [title, abstract] if p).strip()
+    return ""
+
+
+def _paper_text_for_trace(p: dict) -> str:
+    title = (p.get("title") or "").strip()
+    abstract = (p.get("abstract") or "").strip()
+    return "\n\n".join(x for x in [title, abstract] if x).strip()
+
+
+def _impact_score(citations: int, max_log_citations: float) -> float:
+    if max_log_citations <= 0:
+        return 0.0
+    return math.log1p(max(0, citations)) / max_log_citations
+
+
+def _score_trace_candidates(
+    query_text: str,
+    candidates: list[dict],
+    *,
+    cfg: Config | None = None,
+) -> list[dict]:
+    """Rank candidates by semantic abstract relevance plus modest impact."""
+    import numpy as np
+
+    from scholaraio.vectors import _embed_batch
+
+    if not candidates:
+        return []
+
+    texts = [_paper_text_for_trace(p) for p in candidates]
+    query_vec = np.array(_embed_batch([query_text], cfg)[0], dtype="float32")
+    non_empty = [t if t else "[no abstract]" for t in texts]
+    cand_vecs = np.array(_embed_batch(non_empty, cfg), dtype="float32")
+    rel = cand_vecs @ query_vec
+    max_log = max((math.log1p(max(0, int(p.get("cited_by_count", 0) or 0))) for p in candidates), default=0.0)
+
+    scored = []
+    for p, sim, txt in zip(candidates, rel.tolist(), texts):
+        citations = int(p.get("cited_by_count", 0) or 0)
+        impact = _impact_score(citations, max_log)
+        final = 0.8 * float(sim) + 0.2 * impact
+        if not txt or len((p.get("abstract") or "").strip()) < 40:
+            final -= 0.08
+        scored.append(
+            {
+                **p,
+                "relevance_score": round(float(sim), 6),
+                "impact_score": round(float(impact), 6),
+                "final_score": round(float(final), 6),
+            }
+        )
+    scored.sort(key=lambda x: (x["final_score"], x["relevance_score"], x.get("cited_by_count", 0)), reverse=True)
+    return scored
+
+
+def _trace_expand_neighbors(
+    seeds: list[dict],
+    ads_api_token: str,
+    *,
+    forward: bool,
+    backward: bool,
+) -> list[dict]:
+    """Expand ADS citations/references for current frontier."""
+    out: list[dict] = []
+    for seed in seeds:
+        bibcode = seed.get("ads_bibcode", "")
+        if not bibcode:
+            continue
+        if backward:
+            papers, _ = _fetch_ads_page(f"references(bibcode:{bibcode})", ads_api_token, rows=200, sort="date desc")
+            for p in papers:
+                p["discovery_mode"] = "backward"
+                p.setdefault("discovered_from", []).append(bibcode)
+            out.extend(papers)
+        if forward:
+            papers, _ = _fetch_ads_page(f"citations(bibcode:{bibcode})", ads_api_token, rows=200, sort="citation_count desc")
+            for p in papers:
+                p["discovery_mode"] = "forward"
+                p.setdefault("discovered_from", []).append(bibcode)
+            out.extend(papers)
+    return out
+
+
+def _merge_trace_candidates(candidates: list[dict]) -> list[dict]:
+    merged: dict[str, dict] = {}
+    for p in candidates:
+        pid = _trace_pid(p)
+        if not pid:
+            continue
+        if pid not in merged:
+            merged[pid] = {**p, "discovered_from": list(dict.fromkeys(p.get("discovered_from") or []))}
+            continue
+        cur = merged[pid]
+        if len((p.get("abstract") or "").strip()) > len((cur.get("abstract") or "").strip()):
+            cur["abstract"] = p.get("abstract", "")
+        if not cur.get("doi") and p.get("doi"):
+            cur["doi"] = p["doi"]
+        if p.get("cited_by_count", 0) > cur.get("cited_by_count", 0):
+            cur["cited_by_count"] = p.get("cited_by_count", 0)
+        cur["discovered_from"] = list(dict.fromkeys((cur.get("discovered_from") or []) + (p.get("discovered_from") or [])))
+        if not cur.get("discovery_mode"):
+            cur["discovery_mode"] = p.get("discovery_mode", "")
+    return list(merged.values())
+
+
+def _filter_trace_candidates(
+    candidates: list[dict],
+    *,
+    year_range: str | None = None,
+    min_citations: int | None = None,
+) -> list[dict]:
+    if not year_range and min_citations is None:
+        return candidates
+    from scholaraio.papers import parse_year_range
+
+    start = end = None
+    if year_range:
+        start, end = parse_year_range(year_range)
+    out = []
+    for p in candidates:
+        year = p.get("year")
+        if start is not None and (year is None or int(year) < start):
+            continue
+        if end is not None and (year is None or int(year) > end):
+            continue
+        if min_citations is not None and int(p.get("cited_by_count", 0) or 0) < min_citations:
+            continue
+        out.append(p)
+    return out
+
+
+def _write_papers_jsonl(path: Path, papers: list[dict]) -> None:
+    with open(path, "w", encoding="utf-8") as f:
+        for p in papers:
+            f.write(json.dumps(p, ensure_ascii=False) + "\n")
+
+
+def _write_trace_report(name: str, meta: dict, papers: list[dict], cfg: Config | None = None) -> Path:
+    report_path = _explore_dir(name, cfg) / _TRACE_REPORT
+    lines = [
+        f"# Explore Trace Report: {name}",
+        "",
+        f"- Seeds: starting_paper={meta.get('starting_paper') or ''} keyword={meta.get('keyword') or ''}",
+        f"- Rounds: {meta.get('rounds', 0)}",
+        f"- Beam width: {meta.get('top_per_round', 0)}",
+        f"- Directions: forward={meta.get('forward')} backward={meta.get('backward')}",
+        f"- Final papers: {len(papers)}",
+        "",
+        "## Per-round Stats",
+        "",
+    ]
+    for r in meta.get("round_stats", []):
+        lines.append(
+            f"- round {r['round']}: expanded={r['expanded']} discovered={r['discovered']} retained={r['retained']}"
+        )
+    lines.extend(["", "## Top Papers", ""])
+    for i, p in enumerate(sorted(papers, key=lambda x: x.get("final_score", 0), reverse=True)[:20], start=1):
+        lines.append(
+            f"{i}. [{p.get('year','?')}] {p.get('title','')} "
+            f"(score={p.get('final_score', 0):.3f}, cited={p.get('cited_by_count', 0)})"
+        )
+    report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return report_path
+
+
+def trace_explore(
+    name: str,
+    *,
+    starting_paper: str | None = None,
+    keyword: str | None = None,
+    rounds: int = 2,
+    top_per_round: int = 10,
+    year_range: str | None = None,
+    min_citations: int | None = None,
+    forward: bool = True,
+    backward: bool = True,
+    cfg: Config | None = None,
+) -> int:
+    """Recursively trace ADS references/citations around a seed and store an explore silo."""
+    if not starting_paper and not keyword:
+        raise ValueError("trace 至少需要 --starting-paper 或 --keyword")
+    if not forward and not backward:
+        raise ValueError("trace 至少需要启用 --forward 或 --backward 之一")
+    if cfg is None:
+        raise ValueError("trace 需要配置对象")
+    ads_api_token = cfg.resolved_ads_api_token()
+    if not ads_api_token:
+        raise ValueError("ADS API token 未配置。请在 config.local.yaml 或环境变量 ADS_API_TOKEN 中设置。")
+
+    out_dir = _explore_dir(name, cfg)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    papers_file = _papers_path(name, cfg)
+    meta_file = _meta_path(name, cfg)
+
+    seed_meta: dict | None = None
+    initial_candidates: list[dict] = []
+    if starting_paper:
+        seed_meta, seed_ads = _resolve_local_seed(cfg, starting_paper)
+        seed_ads = {**seed_ads, "discovery_mode": "seed_paper", "round": 0, "local_seed_ref": starting_paper}
+        initial_candidates.append(seed_ads)
+    if keyword:
+        ads_query = _build_ads_query(keyword=keyword, year_range=year_range, min_citations=min_citations)
+        papers, _ = _fetch_ads_page(ads_query, ads_api_token, rows=max(50, top_per_round * 10), sort="citation_count desc")
+        for p in papers:
+            p["discovery_mode"] = "seed_keyword"
+            p["round"] = 0
+        initial_candidates.extend(papers)
+
+    initial_candidates = _merge_trace_candidates(initial_candidates)
+    target_text = _build_trace_target_text(seed_meta, keyword)
+    if not target_text:
+        raise ValueError("无法构建 trace 的目标文本，请确认起始论文存在 abstract 或提供 --keyword。")
+    initial_candidates = _filter_trace_candidates(initial_candidates, year_range=year_range, min_citations=min_citations)
+    scored_initial = _score_trace_candidates(target_text, initial_candidates, cfg=cfg)
+    frontier = scored_initial[:top_per_round]
+
+    selected: dict[str, dict] = {}
+    for p in frontier:
+        pid = _trace_pid(p)
+        if pid:
+            selected[pid] = p
+
+    seen = set(selected)
+    round_stats = [{"round": 0, "expanded": len(initial_candidates), "discovered": len(initial_candidates), "retained": len(frontier)}]
+
+    for round_idx in range(1, rounds + 1):
+        neighbors = _trace_expand_neighbors(frontier, ads_api_token, forward=forward, backward=backward)
+        merged = _merge_trace_candidates(neighbors)
+        merged = [p for p in merged if (pid := _trace_pid(p)) and pid not in seen]
+        merged = _filter_trace_candidates(merged, year_range=year_range, min_citations=min_citations)
+        for p in merged:
+            p["round"] = round_idx
+        scored = _score_trace_candidates(target_text, merged, cfg=cfg)
+        frontier = scored[:top_per_round]
+        for p in frontier:
+            pid = _trace_pid(p)
+            if pid:
+                seen.add(pid)
+                selected[pid] = p
+        round_stats.append(
+            {"round": round_idx, "expanded": len(neighbors), "discovered": len(merged), "retained": len(frontier)}
+        )
+        if not frontier:
+            break
+
+    final_papers = sorted(selected.values(), key=lambda x: (x.get("final_score", 0), x.get("year") or 0), reverse=True)
+    _write_papers_jsonl(papers_file, final_papers)
+
+    meta = {
+        "name": name,
+        "mode": "trace",
+        "source": "ads",
+        "starting_paper": starting_paper,
+        "keyword": keyword,
+        "rounds": rounds,
+        "top_per_round": top_per_round,
+        "forward": forward,
+        "backward": backward,
+        "year_range": year_range,
+        "min_citations": min_citations,
+        "count": len(final_papers),
+        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "round_stats": round_stats,
+    }
+    meta_file.write_text(json.dumps(meta, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    _write_trace_report(name, meta, final_papers, cfg=cfg)
+    ui(f"Done: traced {len(final_papers)} papers -> {papers_file}")
+    return len(final_papers)
+
+
+def summarize_trace(name: str, *, cfg: Config | None = None) -> Path:
+    """Generate an LLM Markdown summary for an explore trace run."""
+    from scholaraio.metrics import call_llm
+
+    papers = list(iter_papers(name, cfg))
+    if not papers:
+        raise FileNotFoundError(f"trace 结果为空: {name}")
+    meta = {}
+    meta_path = _meta_path(name, cfg)
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text("utf-8"))
+    if meta.get("mode") != "trace":
+        raise ValueError(f"{name} 不是 trace 结果库")
+
+    top = sorted(papers, key=lambda x: x.get("final_score", 0), reverse=True)[:20]
+    paper_lines = []
+    for i, p in enumerate(top, start=1):
+        paper_lines.append(
+            f"{i}. {p.get('title','')} | year={p.get('year')} | cited={p.get('cited_by_count',0)} | "
+            f"score={p.get('final_score',0):.3f}\nAbstract: {p.get('abstract','')[:1200]}"
+        )
+    prompt = (
+        "Please write a concise literature exploration summary in Markdown.\n\n"
+        f"Trace meta:\n{json.dumps(meta, ensure_ascii=False, indent=2)}\n\n"
+        "Top papers:\n"
+        + "\n\n".join(paper_lines)
+        + "\n\n"
+        "Structure:\n"
+        "1. Overview of the traced literature cluster\n"
+        "2. Main themes/subtopics\n"
+        "3. Most relevant papers and why\n"
+        "4. Potential tangents or likely lower-relevance high-impact papers\n"
+        "5. Suggested next exploration directions\n"
+    )
+    result = call_llm(prompt, cfg, purpose="explore.trace.summary", json_mode=False, max_tokens=2200)
+    out = _explore_dir(name, cfg) / _TRACE_SUMMARY
+    out.write_text(result.content.strip() + "\n", encoding="utf-8")
+    return out
 
 
 def fetch_explore(
